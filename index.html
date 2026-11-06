@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>home.home</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23233a36'/%3E%3Crect x='7' y='9' width='18' height='14' rx='2' fill='none' stroke='%23e9efe9' stroke-width='2.4'/%3E%3Ccircle cx='16' cy='16' r='3' fill='%23e9a23b'/%3E%3C/svg%3E">
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #eceeea;
+  --surface: #f8f9f6;
+  --ink: #1b2623;
+  --muted: #5d6b66;
+  --line: #d3d9d3;
+  --track: #dde2dc;
+  --comfy: #b86a00;
+  --comfy-soft: #f6e6cc;
+  --llama: #3b4fb8;
+  --llama-soft: #dde2f7;
+  --ok: #2c7a4b;
+  --bad: #b3372c;
+  --warn: #b86a00;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131a18;
+    --surface: #1b2421;
+    --ink: #e6ece8;
+    --muted: #8f9d97;
+    --line: #2b3733;
+    --track: #27322e;
+    --comfy: #e9a23b;
+    --comfy-soft: #3a2f1b;
+    --llama: #8f9cf0;
+    --llama-soft: #262c4d;
+    --ok: #5cc185;
+    --bad: #ef7a6c;
+    --warn: #e9a23b;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131a18; --surface: #1b2421; --ink: #e6ece8; --muted: #8f9d97; --line: #2b3733;
+  --track: #27322e; --comfy: #e9a23b; --comfy-soft: #3a2f1b; --llama: #8f9cf0; --llama-soft: #262c4d;
+  --ok: #5cc185; --bad: #ef7a6c; --warn: #e9a23b;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { background: var(--bg); }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.45 "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+  padding: clamp(16px, 4vw, 48px);
+}
+main { max-width: 980px; margin: 0 auto; }
+a { color: inherit; }
+:focus-visible { outline: 3px solid var(--llama); outline-offset: 2px; border-radius: 4px; }
+.num { font-variant-numeric: tabular-nums; }
+
+/* ---- hero ---- */
+.hero { padding: 8px 0 28px; }
+.hero h1 {
+  font-size: clamp(30px, 6vw, 52px);
+  line-height: 1.1;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+.hero h1 .who { white-space: nowrap; }
+.hero p { margin-top: 10px; color: var(--muted); font-size: 18px; max-width: 60ch; }
+
+/* GPU slot: a single bar that highlights whoever holds the GPU */
+.slot {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  margin-top: 22px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--track);
+  padding: 4px;
+  gap: 4px;
+}
+.slot div {
+  border-radius: 999px;
+  padding: 10px 18px;
+  text-align: center;
+  font-weight: 600;
+  color: var(--muted);
+  transition: background .25s, color .25s;
+}
+.slot div[data-on="comfyui"] { background: var(--comfy); color: #fff; }
+.slot div[data-on="llama"] { background: var(--llama); color: #fff; }
+.slot div[data-on="prep"] { background: var(--surface); color: var(--ink); outline: 2px dashed var(--muted); outline-offset: -3px; }
+@media (prefers-color-scheme: dark) {
+  .slot div[data-on="comfyui"], .slot div[data-on="llama"] { color: #14110a; }
+}
+
+/* ---- panels ---- */
+.cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-top: 8px; }
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 20px 22px 22px;
+  border-top: 5px solid var(--line);
+}
+.panel.comfy { --accent: var(--comfy); --accent-soft: var(--comfy-soft); }
+.panel.llama { --accent: var(--llama); --accent-soft: var(--llama-soft); }
+.panel[data-state="busy"], .panel[data-state="loaded"] { border-top-color: var(--accent); }
+.panel[data-state="down"] { border-top-color: var(--bad); }
+.panel header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.panel h2 { font-size: 22px; font-weight: 650; }
+.badge {
+  font-size: 14px; font-weight: 600; padding: 3px 12px; border-radius: 999px;
+  background: var(--track); color: var(--muted); white-space: nowrap;
+}
+.panel[data-state="busy"] .badge { background: var(--accent); color: #fff; }
+.panel[data-state="loaded"] .badge { background: var(--accent-soft); color: var(--accent); }
+.panel[data-state="down"] .badge { background: transparent; color: var(--bad); border: 1px solid var(--bad); }
+@media (prefers-color-scheme: dark) {
+  .panel[data-state="busy"] .badge { color: #14110a; }
+}
+.panel .detail { margin-top: 12px; min-height: 3em; color: var(--ink); }
+.panel .detail small { display: block; color: var(--muted); font-size: 14px; margin-top: 2px; word-break: break-word; }
+
+.speed { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.speed .big { font-size: 34px; font-weight: 650; line-height: 1; letter-spacing: -0.02em; color: var(--muted); }
+.speed.live .big { color: var(--accent); }
+.speed .unit { font-size: 15px; color: var(--muted); }
+.speed .note { flex-basis: 100%; font-size: 14px; color: var(--muted); }
+
+.meter { margin-top: 14px; }
+.meter .row { display: flex; justify-content: space-between; font-size: 14px; color: var(--muted); margin-bottom: 5px; }
+.bar { height: 10px; background: var(--track); border-radius: 999px; overflow: hidden; }
+.bar > i { display: block; height: 100%; width: 0; background: var(--accent, var(--ink)); border-radius: 999px; transition: width .5s ease; }
+.bar.warn > i { background: var(--warn); }
+.bar.bad > i { background: var(--bad); }
+
+/* ---- memory ---- */
+section { margin-top: 36px; }
+section > h2 { font-size: 20px; font-weight: 650; margin-bottom: 12px; }
+.mem { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px 28px; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px 22px 20px; }
+.mem .meter { margin-top: 0; }
+.mem .bar > i { background: var(--ink); opacity: .75; }
+.mem .bar.warn > i, .mem .bar.bad > i { opacity: 1; }
+
+/* ---- services ---- */
+.services { list-style: none; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+.services li { border-top: 1px solid var(--line); }
+.services li:first-child { border-top: 0; }
+.svc { display: grid; grid-template-columns: 14px 1fr auto; gap: 14px; align-items: center; padding: 14px 22px; text-decoration: none; }
+a.svc:hover { background: var(--track); }
+.dot { width: 12px; height: 12px; border-radius: 50%; background: var(--bad); }
+.dot.up { background: var(--ok); }
+.svc .name { font-weight: 600; }
+.svc .desc { color: var(--muted); font-size: 14px; }
+.svc .state { font-size: 14px; color: var(--muted); text-align: right; }
+.svc .state.down { color: var(--bad); font-weight: 600; }
+
+/* ---- footer / banner ---- */
+.banner { display: none; margin-bottom: 18px; padding: 12px 16px; border-radius: 10px; border: 1px solid var(--bad); color: var(--bad); background: var(--surface); }
+.banner.show { display: block; }
+footer { margin-top: 34px; color: var(--muted); font-size: 14px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.foot-actions { display: flex; gap: 18px; }
+footer button { background: none; border: 0; color: inherit; font: inherit; cursor: pointer; text-decoration: underline; }
+
+.pulse { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .55; } }
+@media (prefers-reduced-motion: reduce) {
+  .pulse { animation: none; }
+  .bar > i, .slot div { transition: none; }
+}
+</style>
+</head>
+<body>
+<main>
+  <div id="banner" class="banner" role="alert" data-i18n="banner"></div>
+
+  <div class="hero">
+    <h1 id="headline" aria-live="polite" data-i18n="checking"></h1>
+    <p id="subline"></p>
+    <div class="slot" aria-hidden="true">
+      <div id="slot-comfyui">ComfyUI</div>
+      <div id="slot-llama">llama.cpp</div>
+    </div>
+  </div>
+
+  <div class="cols">
+    <article class="panel comfy" id="p-comfyui" data-state="idle">
+      <header><h2>ComfyUI</h2><span class="badge" id="b-comfyui">…</span></header>
+      <div class="detail" id="d-comfyui"></div>
+      <div class="meter">
+        <div class="row"><span data-i18n="memGPU"></span><span class="num" id="v-comfyui">—</span></div>
+        <div class="bar"><i id="m-comfyui"></i></div>
+      </div>
+    </article>
+    <article class="panel llama" id="p-llama" data-state="idle">
+      <header><h2>llama.cpp</h2><span class="badge" id="b-llama">…</span></header>
+      <div class="detail" id="d-llama"></div>
+      <div class="speed" id="s-llama" aria-live="off"></div>
+      <div class="meter">
+        <div class="row"><span data-i18n="memGPU"></span><span class="num" id="v-llama">—</span></div>
+        <div class="bar"><i id="m-llama"></i></div>
+      </div>
+    </article>
+  </div>
+
+  <section>
+    <h2 data-i18n="memHeading"></h2>
+    <div class="mem" id="mem"></div>
+  </section>
+
+  <section>
+    <h2 data-i18n="svcHeading"></h2>
+    <ul class="services" id="services"></ul>
+  </section>
+
+  <footer>
+    <span id="updated" data-i18n="neverUpdated"></span>
+    <span class="foot-actions">
+      <button type="button" id="lang"></button>
+      <button type="button" id="theme" data-i18n="themeBtn"></button>
+    </span>
+  </footer>
+</main>
+
+<script>
+(function () {
+  'use strict';
+  var API = '/api/status';
+  var POLL_MS = 2000;
+  var $ = function (id) { return document.getElementById(id); };
+  var NAMES = { comfyui: 'ComfyUI', llama: 'llama.cpp' };
+  var failures = 0;
+  var timer = null;
+  var lastData = null;
+
+  // ---- i18n ----
+  var STR = {
+    en: {
+      banner: 'No connection to the status service. Check that gpu-router is running and that Caddy proxies /api/ to port 8190.',
+      checking: 'Checking GPU…',
+      memGPU: 'GPU memory', memHeading: 'Memory', svcHeading: 'Services',
+      neverUpdated: 'Not updated yet', themeBtn: 'Toggle theme',
+      updatedAt: 'Updated at {time}',
+      gpuFree: 'GPU is free', gpuDirect: 'GPU is busy (direct access)',
+      queueN: '{n} {tasks} in the queue.', queueEmpty: 'The queue is empty, ready to go.',
+      switching: 'GPU is switching to ', unloading: 'Unloading the previous models, this takes up to a minute.',
+      busyPrefix: 'GPU busy: ', runningFor: 'Running for {d}. ',
+      waiting: 'Waiting in the queue: {n}.', noOthers: 'No other tasks in the queue.',
+      notResponding: 'Not responding', svcUnavailable: 'Service unavailable.',
+      restartHint: 'If it is restarting, the status will update on its own.',
+      working: 'Working', genRunning: 'Generation in progress',
+      moreInComfy: ', {q} more in the ComfyUI queue', taskRunning: 'A task is running',
+      handlingN: 'Handling {n} {requests} at once', handling1: 'Handling a request',
+      modelLabel: 'Model: ', slotsBusy: 'slots in use: {n} of {s}',
+      inMemory: 'In memory', idleHolding: 'Idle, but holding GPU memory.',
+      loadedLabel: 'Loaded: ', willFree: 'Will be freed when another service needs the GPU.',
+      free: 'Free', memFreed: 'GPU memory is free.', notMeasured: 'not measured',
+      tps: 'tok/s', speedTotal: 'combined across {n} requests, right now', speedLive: 'generating right now',
+      lastAnswer: 'last answer', promptRead: 'prompt processing {n} tok/s', noAnswers: 'no answers since the proxy started',
+      ago: { s: '{n} s ago', min: '{n} min ago', h: '{n} h ago' },
+      dur: { h: 'h', min: 'min', s: 's' }, gib: 'GiB', mib: 'MiB', of: 'of',
+      ramAvail: 'RAM available', vramUsed: 'VRAM used', gttUsed: 'GTT used (shared RAM)',
+      noMemData: 'Memory data is unavailable.',
+      up: 'up · {ms} ms', down: 'unavailable',
+      other: 'Русский',
+      nouns: { tasks: ['task', 'tasks'], requests: ['request', 'requests'], tokens: ['token', 'tokens'] }
+    },
+    ru: {
+      banner: 'Нет связи со службой статуса. Проверьте, что gpu-router запущен и Caddy проксирует /api/ на порт 8190.',
+      checking: 'Проверяю GPU…',
+      memGPU: 'Память GPU', memHeading: 'Память', svcHeading: 'Сервисы',
+      neverUpdated: 'Ещё не обновлялось', themeBtn: 'Сменить тему',
+      updatedAt: 'Обновлено в {time}',
+      gpuFree: 'GPU свободен', gpuDirect: 'GPU занят напрямую',
+      queueN: 'В очереди {n} {tasks}.', queueEmpty: 'Очередь пуста, можно запускать.',
+      switching: 'GPU переходит к ', unloading: 'Выгружаю предыдущие модели, это занимает до минуты.',
+      busyPrefix: 'GPU занят: ', runningFor: 'Работает {d}. ',
+      waiting: 'Ждут своей очереди: {n}.', noOthers: 'Других задач в очереди нет.',
+      notResponding: 'Не отвечает', svcUnavailable: 'Сервис недоступен.',
+      restartHint: 'Если он перезапускается, статус обновится сам.',
+      working: 'Работает', genRunning: 'Генерация идёт',
+      moreInComfy: ', ещё {q} в очереди ComfyUI', taskRunning: 'Идёт задача',
+      handlingN: 'Обрабатывает {n} {requests} одновременно', handling1: 'Обрабатывает запрос',
+      modelLabel: 'Модель: ', slotsBusy: 'слотов занято {n} из {s}',
+      inMemory: 'В памяти', idleHolding: 'Простаивает, но держит память GPU.',
+      loadedLabel: 'Загружено: ', willFree: 'Освободится, когда GPU понадобится другому.',
+      free: 'Свободен', memFreed: 'Память GPU освобождена.', notMeasured: 'не измеряется',
+      tps: 'ток/с', speedTotal: 'суммарно по {n} запросам, прямо сейчас', speedLive: 'генерация идёт прямо сейчас',
+      lastAnswer: 'последний ответ', promptRead: 'чтение промпта {n} ток/с', noAnswers: 'ответов с момента запуска прокси ещё не было',
+      ago: { s: '{n} с назад', min: '{n} мин назад', h: '{n} ч назад' },
+      dur: { h: 'ч', min: 'мин', s: 'с' }, gib: 'ГиБ', mib: 'МиБ', of: 'из',
+      ramAvail: 'ОЗУ доступно', vramUsed: 'VRAM занято', gttUsed: 'GTT занято (общая ОЗУ)',
+      noMemData: 'Данные о памяти недоступны.',
+      up: 'работает · {ms} мс', down: 'недоступен',
+      other: 'English',
+      nouns: { tasks: ['задача', 'задачи', 'задач'], requests: ['запрос', 'запроса', 'запросов'], tokens: ['токен', 'токена', 'токенов'] }
+    }
+  };
+  var lang = 'en';
+  try { lang = localStorage.getItem('home-lang') || ''; } catch (e) {}
+  if (!STR[lang]) lang = /^ru\b/i.test(navigator.language || '') ? 'ru' : 'en';
+
+  // tr('key', {n: 3}): a dictionary string with {n} substituted
+  function tr(key, vars) {
+    var v = STR[lang][key];
+    if (v === undefined) v = STR.en[key];
+    if (typeof v !== 'string') return key;
+    return v.replace(/\{(\w+)\}/g, function (_, k) { return vars && vars[k] !== undefined ? vars[k] : ''; });
+  }
+  // noun('tasks', 5): the word in the right plural form
+  function noun(key, n) {
+    var f = STR[lang].nouns[key];
+    if (lang === 'ru') {
+      var a = Math.abs(n) % 100, b = a % 10;
+      if (a > 10 && a < 20) return f[2];
+      if (b > 1 && b < 5) return f[1];
+      if (b === 1) return f[0];
+      return f[2];
+    }
+    return n === 1 ? f[0] : f[1];
+  }
+  function applyStatic() {
+    document.documentElement.lang = lang;
+    var els = document.querySelectorAll('[data-i18n]');
+    for (var i = 0; i < els.length; i++) els[i].textContent = tr(els[i].getAttribute('data-i18n'));
+    $('lang').textContent = STR[lang].other;
+    $('lang').setAttribute('lang', lang === 'ru' ? 'en' : 'ru');
+  }
+
+  function fmtDur(sec) {
+    sec = Math.max(0, Math.round(sec));
+    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    var u = STR[lang].dur;
+    if (h) return h + ' ' + u.h + ' ' + m + ' ' + u.min;
+    if (m) return m + ' ' + u.min + ' ' + s + ' ' + u.s;
+    return s + ' ' + u.s;
+  }
+  function fmtMB(mb) {
+    if (mb == null) return '—';
+    return mb >= 1024 ? (mb / 1024).toFixed(1) + ' ' + STR[lang].gib : mb + ' ' + STR[lang].mib;
+  }
+  function setBar(id, pct, level) {
+    var el = $(id);
+    el.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    el.parentNode.className = 'bar' + (level ? ' ' + level : '');
+  }
+
+  function render(d) {
+    var act = d.active || {};
+    var who = act.service ? NAMES[act.service] : '';
+
+    // --- headline ---
+    var h = $('headline'), sub = $('subline');
+    h.textContent = '';
+    if (!act.service) {
+      var busyElsewhere = d.comfyui.state === 'busy' || d.llama.state === 'busy';
+      h.textContent = tr(busyElsewhere ? 'gpuDirect' : 'gpuFree');
+      sub.textContent = d.queue_size > 0
+        ? tr('queueN', { n: d.queue_size, tasks: noun('tasks', d.queue_size) })
+        : tr('queueEmpty');
+    } else if (act.phase === 'preparing') {
+      h.appendChild(document.createTextNode(tr('switching')));
+      var w1 = document.createElement('span'); w1.className = 'who'; w1.textContent = who; h.appendChild(w1);
+      sub.textContent = tr('unloading');
+    } else {
+      h.appendChild(document.createTextNode(tr('busyPrefix')));
+      var w2 = document.createElement('span'); w2.className = 'who'; w2.textContent = who; h.appendChild(w2);
+      sub.textContent = tr('runningFor', { d: fmtDur(act.since_sec) }) +
+        (d.queue_size > 0 ? tr('waiting', { n: d.queue_size }) : tr('noOthers'));
+    }
+
+    // --- who holds the GPU ---
+    var onFor = function (svc) {
+      if (act.service !== svc) return '';
+      return act.phase === 'preparing' ? 'prep' : svc;
+    };
+    $('slot-comfyui').setAttribute('data-on', onFor('comfyui'));
+    $('slot-llama').setAttribute('data-on', onFor('llama'));
+
+    // --- shared memory scale to compare the services ---
+    var scale = 0;
+    if (d.gpu_mem) scale = (d.gpu_mem.vram_total_mb > 0 ? d.gpu_mem.vram_total_mb : 0) + (d.gpu_mem.gtt_total_mb > 0 ? d.gpu_mem.gtt_total_mb : 0);
+    scale = Math.max(scale, (d.comfyui.vram_mb || 0), (d.llama.vram_mb || 0), 4096);
+
+    panel('comfyui', d.comfyui, scale, d);
+    panel('llama', d.llama, scale, d);
+    memory(d);
+    services(d.services || []);
+
+    var when = new Date(d.time * 1000);
+    $('updated').textContent = tr('updatedAt', { time: when.toLocaleTimeString(lang === 'ru' ? 'ru-RU' : 'en-GB') });
+  }
+
+  function panel(key, b, scale, d) {
+    var p = $('p-' + key), badge = $('b-' + key), det = $('d-' + key);
+    var state = b.state;
+    p.setAttribute('data-state', state);
+    badge.className = 'badge' + (state === 'busy' ? ' pulse' : '');
+    det.textContent = '';
+
+    var line = document.createElement('div'), small = document.createElement('small');
+    if (state === 'down') {
+      badge.textContent = tr('notResponding');
+      line.textContent = tr('svcUnavailable');
+      small.textContent = tr('restartHint');
+    } else if (state === 'busy') {
+      badge.textContent = tr('working');
+      if (key === 'comfyui') {
+        var r = b.running || 0, q = b.pending || 0;
+        line.textContent = tr('genRunning') + (q ? tr('moreInComfy', { q: q }) : '');
+        if (!r && !q) line.textContent = tr('taskRunning');
+      } else {
+        var n = b.inflight || 1, slots = b.slots || 1;
+        line.textContent = n > 1
+          ? tr('handlingN', { n: n, requests: noun('requests', n) })
+          : tr('handling1');
+        var model = b.model || (b.models && b.models.length ? b.models.join(', ') : '');
+        var info = [];
+        if (model) info.push(tr('modelLabel') + model);
+        if (slots > 1) info.push(tr('slotsBusy', { n: n, s: slots }));
+        small.textContent = info.join(' · ');
+      }
+    } else if (state === 'loaded') {
+      badge.textContent = tr('inMemory');
+      line.textContent = tr('idleHolding');
+      small.textContent = (b.models && b.models.length) ? tr('loadedLabel') + b.models.join(', ') : tr('willFree');
+    } else {
+      badge.textContent = tr('free');
+      line.textContent = tr('memFreed');
+    }
+    det.appendChild(line);
+    if (small.textContent) det.appendChild(small);
+
+    if (key === 'llama') speed(b.speed, b.inflight || 0);
+
+    var mb = b.vram_mb;
+    $('v-' + key).textContent = mb == null ? tr('notMeasured') : fmtMB(mb);
+    setBar('m-' + key, mb == null ? 0 : (mb / scale) * 100, '');
+  }
+
+  function speed(sp, inflight) {
+    var box = $('s-llama');
+    box.textContent = '';
+    box.className = 'speed';
+    sp = sp || {};
+    var big = document.createElement('span'); big.className = 'big num';
+    var unit = document.createElement('span'); unit.className = 'unit'; unit.textContent = tr('tps');
+    var note = document.createElement('span'); note.className = 'note';
+
+    if (sp.tps_live != null) {
+      box.className = 'speed live';
+      big.textContent = sp.tps_live.toFixed(1);
+      note.textContent = inflight > 1 ? tr('speedTotal', { n: inflight }) : tr('speedLive');
+    } else if (sp.tps_last != null) {
+      big.textContent = sp.tps_last.toFixed(1);
+      var parts = [tr('lastAnswer')];
+      if (sp.last_tokens) parts[0] += ': ' + sp.last_tokens + ' ' + noun('tokens', sp.last_tokens);
+      parts.push(ago(sp.last_age_sec));
+      if (sp.prompt_tps_last != null) parts.push(tr('promptRead', { n: Math.round(sp.prompt_tps_last) }));
+      note.textContent = parts.join(' · ');
+    } else {
+      big.textContent = '—';
+      note.textContent = tr('noAnswers');
+    }
+    box.appendChild(big); box.appendChild(unit); box.appendChild(note);
+  }
+  function ago(sec) {
+    sec = sec || 0;
+    var a = STR[lang].ago;
+    if (sec < 60) return a.s.replace('{n}', sec);
+    if (sec < 3600) return a.min.replace('{n}', Math.floor(sec / 60));
+    return a.h.replace('{n}', Math.floor(sec / 3600));
+  }
+
+  function meterRow(label, valueText, pct, level) {
+    var wrap = document.createElement('div'); wrap.className = 'meter';
+    var row = document.createElement('div'); row.className = 'row';
+    var a = document.createElement('span'); a.textContent = label;
+    var b = document.createElement('span'); b.className = 'num'; b.textContent = valueText;
+    row.appendChild(a); row.appendChild(b);
+    var bar = document.createElement('div'); bar.className = 'bar' + (level ? ' ' + level : '');
+    var i = document.createElement('i'); i.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    bar.appendChild(i);
+    wrap.appendChild(row); wrap.appendChild(bar);
+    return wrap;
+  }
+
+  function memory(d) {
+    var box = $('mem');
+    box.textContent = '';
+    if (d.mem_available_mb != null) {
+      // Alert thresholds follow the proxy's logic: below ~1 GiB is already dangerous for an APU.
+      var a = d.mem_available_mb;
+      var level = a < 1024 ? 'bad' : a < 2048 ? 'warn' : '';
+      var total = d.gpu_mem && d.gpu_mem.gtt_total_mb > 0 ? Math.max(a, d.gpu_mem.gtt_total_mb) : Math.max(a, 16384);
+      // The bar shows what is left: a short bar means little free RAM.
+      box.appendChild(meterRow(tr('ramAvail'), fmtMB(a), (a / total) * 100, level));
+    }
+    var g = d.gpu_mem;
+    if (g) {
+      if (g.vram_total_mb > 0) box.appendChild(meterRow(tr('vramUsed'), fmtMB(g.vram_used_mb) + ' ' + tr('of') + ' ' + fmtMB(g.vram_total_mb), (g.vram_used_mb / g.vram_total_mb) * 100, g.vram_used_mb / g.vram_total_mb > 0.95 ? 'warn' : ''));
+      if (g.gtt_total_mb > 0) box.appendChild(meterRow(tr('gttUsed'), fmtMB(g.gtt_used_mb) + ' ' + tr('of') + ' ' + fmtMB(g.gtt_total_mb), (g.gtt_used_mb / g.gtt_total_mb) * 100, g.gtt_used_mb / g.gtt_total_mb > 0.9 ? 'warn' : ''));
+    }
+    if (!box.firstChild) box.textContent = tr('noMemData');
+  }
+
+  function services(list) {
+    var ul = $('services');
+    ul.textContent = '';
+    list.forEach(function (s) {
+      var li = document.createElement('li');
+      var el = document.createElement(s.url ? 'a' : 'div');
+      el.className = 'svc';
+      if (s.url) { el.href = s.url; }
+
+      var dot = document.createElement('span'); dot.className = 'dot' + (s.up ? ' up' : '');
+      var mid = document.createElement('span');
+      var nm = document.createElement('div'); nm.className = 'name'; nm.textContent = s.name;
+      var ds = document.createElement('div'); ds.className = 'desc'; ds.textContent = s.desc || '';
+      mid.appendChild(nm); mid.appendChild(ds);
+      var st = document.createElement('span'); st.className = 'state num' + (s.up ? '' : ' down');
+      st.textContent = s.up ? tr('up', { ms: s.latency_ms }) : tr('down');
+
+      el.appendChild(dot); el.appendChild(mid); el.appendChild(st);
+      li.appendChild(el); ul.appendChild(li);
+    });
+  }
+
+  // ---- polling ----
+  function poll() {
+    var ctl = ('AbortController' in window) ? new AbortController() : null;
+    var to = setTimeout(function () { if (ctl) ctl.abort(); }, 5000);
+    fetch(API, { cache: 'no-store', signal: ctl ? ctl.signal : undefined })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (d) { failures = 0; lastData = d; $('banner').classList.remove('show'); render(d); })
+      .catch(function () {
+        failures++;
+        if (failures >= 2) $('banner').classList.add('show');
+      })
+      .then(function () { clearTimeout(to); schedule(); });
+  }
+  function schedule() {
+    clearTimeout(timer);
+    if (document.hidden) return;
+    timer = setTimeout(poll, POLL_MS);
+  }
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) { clearTimeout(timer); poll(); } });
+
+  // ---- language ----
+  $('lang').addEventListener('click', function () {
+    lang = lang === 'ru' ? 'en' : 'ru';
+    try { localStorage.setItem('home-lang', lang); } catch (e) {}
+    applyStatic();
+    if (lastData) render(lastData);
+  });
+
+  // ---- theme ----
+  $('theme').addEventListener('click', function () {
+    var cur = document.documentElement.getAttribute('data-theme');
+    var sysDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var next = cur ? (cur === 'dark' ? 'light' : 'dark') : (sysDark ? 'light' : 'dark');
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem('home-theme', next); } catch (e) {}
+  });
+  try { var saved = localStorage.getItem('home-theme'); if (saved) document.documentElement.setAttribute('data-theme', saved); } catch (e) {}
+
+  applyStatic();
+  poll();
+})();
+</script>
+</body>
+</html>

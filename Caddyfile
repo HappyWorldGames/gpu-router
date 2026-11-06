@@ -1,0 +1,34 @@
+{
+    local_certs
+}
+
+# Home page: static files from web/ + GPU status from gpu-router
+home.home {
+    # /api/status -> gpu-router's status endpoint (dashboard.port, 8190 by default)
+    handle /api/* {
+        reverse_proxy 127.0.0.1:8190
+    }
+
+    handle {
+        root * /usr/share/caddy      # put web/index.html here
+        file_server
+    }
+}
+
+# ComfyUI: through the queue proxy (proxy.comfyui_port)
+comfyui.home {
+    reverse_proxy 127.0.0.1:8188 {
+        # Recent ComfyUI versions answer 403 to requests with the header
+        # "Sec-Fetch-Site: cross-site" (e.g. following a link from another site such as home.home).
+        # Strip the header.
+        header_up -Sec-Fetch-Site
+        transport http {
+            dial_timeout 60s
+            keepalive 10m
+            response_header_timeout 10m
+            read_timeout 10m
+        }
+    }
+}
+
+# Open WebUI talks to llama.cpp via gpu-router directly (proxy.llama_port): set that URL in Open WebUI.

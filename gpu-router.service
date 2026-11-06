@@ -1,0 +1,18 @@
+[Unit]
+Description=gpu-router: queue and model unloading for ComfyUI and llama.cpp
+After=network.target
+# The proxied services start independently: the proxy waits for them itself.
+
+[Service]
+Type=simple
+# Needs access to /proc/<pid>/fdinfo of the ComfyUI and llama processes (VRAM accounting)
+# and permission to signal them (eviction). Simplest: run as root, or as the same user
+# that runs both services.
+User=root
+WorkingDirectory=/opt/gpu-router
+ExecStart=/opt/gpu-router/gpu-router /opt/gpu-router/config.yaml
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

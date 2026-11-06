@@ -1,0 +1,83 @@
+# gpu-router: example configuration. Copy to config.yaml and adjust.
+# Run: ./gpu-router /path/to/config.yaml   (reads ./config.yaml if no argument is given)
+# A version with Russian comments: config.example.ru.yaml
+
+comfyui:
+  host: "127.0.0.1"
+  port: "8288"                # ComfyUI's own port (clients use proxy.comfyui_port)
+  # systemd unit name (systemctl list-units | grep -i comfy). The proxy uses it to find the
+  # service's processes on the GPU and kill them if the service does not release VRAM.
+  unit: "comfyui.service"
+  # How much VRAM the service may keep AFTER unloading (CUDA context etc.).
+  # More than this counts as a leak. Tune it from the "residual N MB" log line.
+  residual_mb: 2048
+  # Seconds of idleness after which ComfyUI's models are unloaded, without waiting until
+  # llama needs the GPU. 0 = unload only when handing the GPU over.
+  idle_release: 20
+
+llama:
+  host: "127.0.0.1"
+  port: "8180"                # llama-server (router) port; clients use proxy.llama_port
+  unit: "llama.service"       # llama-server unit; child model processes live in its cgroup
+  residual_mb: 512
+  idle_release: 0             # 0 = the model stays in VRAM until ComfyUI needs the GPU
+  # Path to llama.cpp's models.ini. The per-model `parallel` value is read from it
+  # (with the [*] section as default): that many requests may run on an already loaded
+  # model at once. Read once at startup. Empty = parallel requests disabled.
+  models_ini: ""              # e.g. "/etc/llama/models.ini"
+
+proxy:
+  comfyui_port: 8188
+  llama_port: 8080
+  # Address to listen on. "" = all interfaces. If clients run in Docker and reach the host
+  # via host.docker.internal, "127.0.0.1" would cut them off. In that case keep "" and block
+  # the ports with a firewall: the proxy has no authentication of its own.
+  listen_host: ""
+
+queue:
+  max_size: 30
+  wait_timeout: 10800          # how long a task may wait for its turn
+  poll_interval: 5
+  comfy_idle_timeout: 10800    # max ComfyUI generation time; after that it is interrupted/evicted
+  # The next two limits only fire when someone is waiting behind the task: while the queue
+  # is empty, a request may run as long as it needs.
+  exec_idle_timeout: 300       # no data from the backend for this many seconds: abort the request
+  task_timeout: 14400          # hard ceiling per task, so the queue cannot get stuck
+
+gpu:
+  release_timeout: 30          # how long to wait for a soft unload before SIGKILL
+  watchdog_interval: 2         # VRAM conflict check period, seconds
+  restart_wait: 180            # how long to wait for an unavailable service to come back before a task
+  # System RAM (on an APU "VRAM" is the same RAM). If MemAvailable is below the threshold,
+  # a warning with the heaviest processes is logged and the task waits up to mem_wait
+  # seconds for recovery (then proceeds at its own risk). -1 = do not check.
+  min_available_mb: 1024
+  mem_wait: 20
+  # Emergency protection: if MemAvailable stays below this value for 2 consecutive samples,
+  # the proxy stops whoever holds the GPU: softly first, then SIGKILL on the whole unit after
+  # ~4 s without improvement. Faster and more targeted than the kernel OOM killer. -1 = off.
+  critical_available_mb: 512
+  # The same, but while the GPU is not needed (no running task and an empty queue): the model
+  # is not evicted until RAM falls below this lower threshold. 0 = half of
+  # critical_available_mb, -1 = never evict while idle (risk: the kernel OOM killer picks).
+  critical_idle_available_mb: 0
+  kill_on_leak: true           # false = only log, never kill
+  # VRAM data source: auto | fdinfo (AMD/Intel, from the kernel, no tools needed) | nvidia | none
+  backend: "auto"
+  nvidia_smi: "nvidia-smi"
+
+# Status page (see "Status page" in the README).
+dashboard:
+  port: 8190                   # -1 = disabled
+  listen_host: "127.0.0.1"     # Caddy on the same machine connects here
+  services:                    # shown in the "Services" list; addr is checked over TCP
+    - { name: "Open WebUI", addr: "127.0.0.1:3000", url: "https://openwebui.home", desc: "Chat with models" }
+    - { name: "ComfyUI",    addr: "127.0.0.1:8288", url: "https://comfyui.home",   desc: "Images and video" }
+    - { name: "llama.cpp",  addr: "127.0.0.1:8180", url: "",                       desc: "Language model server" }
+
+logging:
+  # false = quiet mode: only startup, the queue ([Start]/[Done]), unloads/evictions,
+  # warnings and errors.
+  verbose: true
+  requests: true               # (with verbose: true) [ComfyUI REQ] / [LLAMA REQ] lines
+  mem_trace: 0                 # (with verbose: true) every N s a RAM/VRAM/GTT snapshot during a task; 0 = off
