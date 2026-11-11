@@ -508,14 +508,72 @@ func isLlamaServicePath(p string) bool {
 
 // loggingMW логирует только значимые запросы. Спам от поллинга ComfyUI
 // и служебных эндпоинтов llama (модели, props, tokenize, WebUI) — гасится.
+// slowBypassThreshold: запрос llama МИМО очереди (служебный путь или GET), который
+// идёт дольше этого времени, считается подозрительным и попадает в лог.
+var slowBypassThreshold = 5 * time.Second
+
+// statusWriter запоминает код ответа, не ломая стриминг (Flush) и ResponseController.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(b []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// longLived: пути, которые по природе висят долго (потоки событий) — не считаем «зависшими».
+func longLived(path string) bool {
+	return path == "/models/sse" || strings.HasPrefix(path, "/v1/stream")
+}
+
 func loggingMW(name string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		var show bool
+		start := time.Now()
+		// Запросы к llama мимо очереди: если такой запрос застрянет (например, router занят
+		// загрузкой модели), без этой записи в логе не было бы ничего.
+		bypass := name == "LLAMA" && !longLived(path) && (isLlamaServicePath(path) || r.Method != http.MethodPost)
+		sw := &statusWriter{ResponseWriter: w}
+		w = sw
+		if bypass {
+			defer func() {
+				if d := time.Since(start); d > slowBypassThreshold {
+					log.Printf("[LLAMA] запрос МИМО очереди шёл %v: %s %s → HTTP %d (клиент %s)",
+						d.Round(time.Millisecond), r.Method, path, sw.status, r.RemoteAddr)
+				}
+			}()
+		}
 
 		switch name {
 		case "LLAMA":
-			// Служебные пути (мимо очереди, GPU не трогают) — вообще не логируем.
+			// Возобновление/просмотр потоков встроенного WebUI (/v1/stream*): это не работа с GPU,
+			// но именно такие запросы могут «висеть», если WebUI пытается продолжить оборванный
+			// ответ, поэтому их видно в логе.
+			if strings.HasPrefix(path, "/v1/stream") {
+				show = true
+				break
+			}
+			// Остальные служебные пути (мимо очереди, GPU не трогают) — не логируем.
 			if isLlamaServicePath(path) {
 				show = false
 				break
@@ -556,7 +614,7 @@ func loggingMW(name string, next http.Handler) http.Handler {
 		}
 
 		if show && logRequests.Load() {
-			log.Printf("[%s REQ] %s %s", name, r.Method, path)
+			log.Printf("[%s REQ] %s %s от %s", name, r.Method, path, r.RemoteAddr)
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -665,7 +723,12 @@ func (s *Server) gpuTask(service string) http.HandlerFunc {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		readStart := time.Now()
 		body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+		if d := time.Since(readStart); d > 3*time.Second || err != nil {
+			log.Printf("[%s] тело запроса от %s читалось %v (%d КБ, ошибка: %v) — клиент медленно шлёт или оборвал соединение",
+				s.name(service), r.RemoteAddr, d.Round(time.Millisecond), len(body)/1024, err)
+		}
 		if err != nil {
 			s.jsonError(w, http.StatusBadRequest, "не удалось прочитать тело")
 			return
@@ -703,7 +766,7 @@ func (s *Server) gpuTask(service string) http.HandlerFunc {
 
 		select {
 		case s.taskQueue <- t:
-			s.vlogf("[Queue] %s в очереди (размер: %d)", s.name(service), len(s.taskQueue))
+			s.vlogf("[Queue] %s в очереди (ждут: %d)", s.name(service), s.queueLen())
 		default:
 			s.jsonError(w, http.StatusServiceUnavailable, "очередь GPU переполнена")
 			return
@@ -855,7 +918,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"active_service": active,
-		"queue_size":     len(s.taskQueue),
+		"queue_size":     s.queueLen(),
 		"vram_mb":        vram,
 		"dirty":          dirty,
 	})
@@ -907,8 +970,9 @@ func (s *Server) worker() {
 		if prepErr != nil {
 			log.Printf("[Switch] ошибка подготовки GPU: %v", prepErr)
 		} else {
-			log.Printf("[Start] %s — ваш ход (подготовка %v)%s",
-				s.name(t.Service), prepDone.Sub(taskStart).Round(time.Millisecond), s.memSuffix())
+			log.Printf("[Start] %s — ваш ход (ждал %v, подготовка %v)%s",
+				s.name(t.Service), time.Since(t.EnqueuedAt).Round(time.Millisecond),
+				prepDone.Sub(taskStart).Round(time.Millisecond), s.memSuffix())
 		}
 		if prepErr == nil {
 			s.mu.Lock()
@@ -2084,6 +2148,12 @@ func (s *Server) execBackend(t *Task) int {
 		}
 	}
 	t.W.WriteHeader(resp.StatusCode)
+	if resp.StatusCode >= 400 {
+		// Прокси ошибку не придумывает, а передаёт клиенту как есть, поэтому в логе
+		// нужно видеть, кто и что ответил (текст ошибки пишется ниже из тела).
+		log.Printf("[%s] бэкенд ответил HTTP %d на %s (модель %q, идёт запросов: %d)",
+			s.name(t.Service), resp.StatusCode, t.Path, t.Model, s.inflightNow())
+	}
 
 	idleLimit := time.Duration(s.Config.Queue.ExecIdleTimeout) * time.Second
 	var lastRead atomic.Int64

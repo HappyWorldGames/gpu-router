@@ -14,6 +14,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"sync"
 	"time"
 )
@@ -75,6 +76,16 @@ func (m *tokenMeter) line(b []byte) {
 	b = bytes.TrimPrefix(b, []byte("data:"))
 	b = bytes.TrimSpace(b)
 	if len(b) == 0 || b[0] != '{' {
+		return
+	}
+	// Ошибка от llama: отдельным JSON ({"error":...}) или событием внутри потока.
+	// Причина HTTP 500 (нехватка KV-кэша, контекст слота и т.п.) написана именно здесь.
+	if bytes.HasPrefix(b, []byte(`{"error"`)) {
+		msg := b
+		if len(msg) > 600 {
+			msg = msg[:600]
+		}
+		log.Printf("[LLAMA] ошибка от llama-server: %s", msg)
 		return
 	}
 	if bytes.Contains(b, []byte(`"timings"`)) {

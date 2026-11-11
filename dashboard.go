@@ -105,7 +105,7 @@ func (s *Server) dashSnapshot() []byte {
 }
 
 func (s *Server) buildDashStatus() *dashStatus {
-	st := &dashStatus{Time: time.Now().Unix(), QueueMax: cap(s.taskQueue), QueueSize: len(s.taskQueue)}
+	st := &dashStatus{Time: time.Now().Unix(), QueueMax: cap(s.taskQueue), QueueSize: s.queueLen()}
 
 	s.mu.Lock()
 	active := s.activeService

@@ -51,10 +51,40 @@ func requestModel(body []byte) string {
 	return ""
 }
 
+// inflightNow — сколько запросов llama идёт прямо сейчас (для логов).
+func (s *Server) inflightNow() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.llamaInflight
+}
+
+// memTooLowToJoin: свободной ОЗУ меньше порога gpu.min_available_mb, поэтому новый
+// параллельный запрос к идущим не присоединяем (он будет ждать в очереди). Параллельные
+// запросы растят расход памяти (кэш промптов между слотами и т.п.), и без этой проверки
+// на пределе ОЗУ они ускоряют путь к аварийной остановке llama.
+func (s *Server) memTooLowToJoin() (bool, int) {
+	min := s.Config.GPU.MinAvailableMB
+	if min <= 0 {
+		return false, 0
+	}
+	avail, err := memAvailableMB()
+	if err != nil {
+		return false, 0
+	}
+	return avail < min, avail
+}
+
+// queueLen — сколько задач ждёт своей очереди: лежат в очереди и ещё та, которую воркер
+// уже взял и держит в admit() (ждёт слот или конца идущих). Без неё казалось бы, что
+// очередь пуста, хотя за идущим запросом кто-то стоит.
+func (s *Server) queueLen() int {
+	return len(s.taskQueue) + int(s.admitWaiting.Load())
+}
+
 // someoneWaits — за идущей задачей кто-то ждёт своей очереди: либо лежит в очереди,
 // либо воркер уже взял его и держит в admit() (ждёт слот или конец идущих запросов).
 func (s *Server) someoneWaits() bool {
-	return len(s.taskQueue) > 0 || s.admitWaiting.Load() > 0
+	return s.queueLen() > 0
 }
 
 // waitDoneOrLimit ждёт конец задачи. Потолок task_timeout нужен, чтобы зависшая задача
@@ -98,22 +128,31 @@ func (s *Server) waitDoneOrLimit(t *Task, limit time.Duration) bool {
 func (s *Server) admit(t *Task) bool {
 	stop := make(chan struct{})
 	defer close(stop)
-	// Если клиент уйдёт, пока задача ждёт, разбудим ожидание.
+	// Будим ожидание: сразу, если клиент ушёл, и раз в 2 с — перепроверить свободную ОЗУ.
 	go func() {
-		select {
-		case <-t.Ctx.Done():
-		case <-t.Done:
-		case <-stop:
-			return
+		tick := time.NewTicker(2 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-t.Ctx.Done():
+			case <-t.Done:
+			case <-tick.C:
+			}
+			s.mu.Lock()
+			s.cond.Broadcast()
+			s.mu.Unlock()
+			if t.abandoned() {
+				return
+			}
 		}
-		s.mu.Lock()
-		s.cond.Broadcast()
-		s.mu.Unlock()
 	}()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	logged := false
+	memLogged := false
 	defer func() {
 		if logged {
 			s.admitWaiting.Add(-1)
@@ -130,14 +169,20 @@ func (s *Server) admit(t *Task) bool {
 		if t.Service == "llama" && t.Model != "" && t.Model == s.llamaModel {
 			limit := s.ini.parallelFor(t.Model)
 			s.llamaLimit = limit
-			if s.llamaInflight < limit {
+			lowRAM, avail := s.memTooLowToJoin()
+			if lowRAM && !memLogged {
+				memLogged = true
+				log.Printf("[Parallel] не присоединяю запрос к идущим: ОЗУ свободно %d МБ < порога %d МБ — жду, пока память освободится",
+					avail, s.Config.GPU.MinAvailableMB)
+			}
+			if s.llamaInflight < limit && !lowRAM {
 				s.llamaInflight++
 				n := s.llamaInflight
 				start := time.Now()
 				close(t.Turn)
 				go s.watchLlama(t, start, 0)
-				log.Printf("[Start] LLAMA — параллельно с идущими (%d из %d слотов), модель %s%s",
-					n, limit, t.Model, s.memSuffix())
+				log.Printf("[Start] LLAMA — параллельно с идущими (%d из %d слотов), ждал %v, модель %s%s",
+					n, limit, time.Since(t.EnqueuedAt).Round(time.Millisecond), t.Model, s.memSuffix())
 				return true
 			}
 		}
