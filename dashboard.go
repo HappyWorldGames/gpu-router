@@ -61,14 +61,16 @@ type dashStatus struct {
 		Phase    string `json:"phase"`   // "", preparing, running
 		SinceSec int    `json:"since_sec"`
 	} `json:"active"`
-	QueueSize  int             `json:"queue_size"`
-	QueueMax   int             `json:"queue_max"`
-	GPUMode    string          `json:"gpu_mode"`
-	MemAvailMB *int            `json:"mem_available_mb"`
-	GPUMem     *dashGPUMem     `json:"gpu_mem"`
-	ComfyUI    dashBackend     `json:"comfyui"`
-	LLAMA      dashBackend     `json:"llama"`
-	Services   []dashSvcStatus `json:"services"`
+	QueueSize     int             `json:"queue_size"`
+	Tasks         []dashTask      `json:"tasks"`
+	CancelEnabled bool            `json:"cancel_enabled"`
+	QueueMax      int             `json:"queue_max"`
+	GPUMode       string          `json:"gpu_mode"`
+	MemAvailMB    *int            `json:"mem_available_mb"`
+	GPUMem        *dashGPUMem     `json:"gpu_mem"`
+	ComfyUI       dashBackend     `json:"comfyui"`
+	LLAMA         dashBackend     `json:"llama"`
+	Services      []dashSvcStatus `json:"services"`
 }
 
 // defaultDashServices — набор по умолчанию, если в config.yaml нет dashboard.services.
@@ -91,6 +93,13 @@ type dashCache struct {
 }
 
 const dashTTL = 2 * time.Second
+
+// invalidate сбрасывает кэш снимка: изменения в очереди видны на странице сразу.
+func (c *dashCache) invalidate() {
+	c.mu.Lock()
+	c.data = nil
+	c.mu.Unlock()
+}
 
 func (s *Server) dashSnapshot() []byte {
 	c := &s.dash
@@ -126,6 +135,8 @@ func (s *Server) buildDashStatus() *dashStatus {
 		}
 	}
 	st.GPUMode = s.gpuMode()
+	st.Tasks = s.listTasks()
+	st.CancelEnabled = s.cancelAllowed()
 
 	var wg sync.WaitGroup
 
@@ -248,6 +259,7 @@ func (s *Server) startDashboard() *http.Server {
 		return nil
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("/api/queue/cancel", s.handleCancel)
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")

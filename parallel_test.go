@@ -64,6 +64,16 @@ func newTask(service, model string) *Task {
 		Turn: make(chan struct{}), Done: make(chan struct{})}
 }
 
+// regTask — задача, зарегистрированная в реестре (как в настоящем обработчике).
+func regTask(s *Server, service, model, id string, state int32) *Task {
+	t := newTask(service, model)
+	t.ID, t.Client = id, "10.0.0.9"
+	t.EnqueuedAt = time.Now()
+	t.state.Store(state)
+	s.register(t)
+	return t
+}
+
 func isClosed(c chan struct{}) bool {
 	select {
 	case <-c:
@@ -191,7 +201,8 @@ func TestWaitDoneOrLimit(t *testing.T) {
 		t.Fatal("задачу прервали, хотя за ней никто не ждёт")
 	}
 	// 2) пришёл второй в очередь: теперь прерываем
-	s.taskQueue <- newTask("llama", "m")
+	q1 := regTask(s, "llama", "m", "q1", stQueued)
+	s.taskQueue <- q1
 	waitFor(t, "cancel after contention", func() bool { return a.Ctx.Err() != nil })
 	close(a.Done)
 	if !<-got {
@@ -209,14 +220,15 @@ func TestWaitDoneOrLimit(t *testing.T) {
 	for len(s.taskQueue) > 0 {
 		<-s.taskQueue
 	}
+	s.unregister(q1)
 	if s.someoneWaits() {
 		t.Fatal("очередь пуста")
 	}
-	s.admitWaiting.Add(1)
+	held := regTask(s, "llama", "m", "h1", stWaiting)
 	if !s.someoneWaits() {
 		t.Fatal("ждущий в admit должен считаться")
 	}
-	s.admitWaiting.Add(-1)
+	s.unregister(held)
 }
 
 func TestBackendErrorLogged(t *testing.T) {
@@ -358,12 +370,123 @@ func TestQueueLenCountsWaiterHeldByWorker(t *testing.T) {
 	if s.queueLen() != 0 {
 		t.Fatal("пусто")
 	}
-	s.taskQueue <- newTask("llama", "m")
-	s.admitWaiting.Add(1) // воркер держит ещё одну в admit()
+	regTask(s, "llama", "m", "a", stQueued)
+	regTask(s, "llama", "m", "b", stWaiting) // воркер держит ещё одну в admit()
+	regTask(s, "llama", "m", "c", stRunning) // идущая в очередь не считается
 	if s.queueLen() != 2 {
 		t.Fatalf("queueLen=%d, ждали 2", s.queueLen())
 	}
-	if st := s.buildDashStatus(); st.QueueSize != 2 {
-		t.Fatalf("на странице queue_size=%d, ждали 2", st.QueueSize)
+	st := s.buildDashStatus()
+	if st.QueueSize != 2 || len(st.Tasks) != 3 {
+		t.Fatalf("на странице queue_size=%d, задач %d (ждали 2 и 3)", st.QueueSize, len(st.Tasks))
+	}
+	if st.Tasks[0].ID != "c" || st.Tasks[0].State != "running" {
+		t.Fatalf("первой должна идти выполняющаяся: %+v", st.Tasks)
+	}
+}
+
+func TestCancelTask(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	s := NewServer(cfg)
+
+	w := regTask(s, "llama", "m", "w1", stWaiting)
+	if code, _ := s.cancelTask("w1", "test"); code != 200 || w.Ctx.Err() == nil || !w.kicked.Load() {
+		t.Fatalf("ждущую задачу llama надо снять: code=%d", code)
+	}
+	r := regTask(s, "llama", "m", "r1", stRunning)
+	if code, _ := s.cancelTask("r1", "test"); code != 200 || r.Ctx.Err() == nil {
+		t.Fatalf("идущий запрос llama можно остановить: code=%d", code)
+	}
+	cq := regTask(s, "comfyui", "", "c1", stQueued)
+	if code, _ := s.cancelTask("c1", "test"); code != 200 || cq.Ctx.Err() == nil {
+		t.Fatalf("ComfyUI из очереди снимается: code=%d", code)
+	}
+	cr := regTask(s, "comfyui", "", "c2", stRunning)
+	if code, _ := s.cancelTask("c2", "test"); code != 409 || cr.Ctx.Err() != nil {
+		t.Fatalf("идущую генерацию ComfyUI отсюда не трогаем: code=%d", code)
+	}
+	if code, _ := s.cancelTask("nope", "test"); code != 404 {
+		t.Fatalf("неизвестная задача: %d", code)
+	}
+	for _, d := range s.listTasks() {
+		if d.ID == "c2" && d.CanCancel {
+			t.Fatal("для идущей ComfyUI-задачи кнопки быть не должно")
+		}
+	}
+}
+
+func TestCancelEndpointGuards(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	s := NewServer(cfg)
+	regTask(s, "llama", "m", "x1", stQueued)
+
+	do := func(method, ctype, hdr, body string) int {
+		req := httptest.NewRequest(method, "/api/queue/cancel", strings.NewReader(body))
+		if ctype != "" {
+			req.Header.Set("Content-Type", ctype)
+		}
+		if hdr != "" {
+			req.Header.Set("X-GPU-Router", hdr)
+		}
+		rec := httptest.NewRecorder()
+		s.handleCancel(rec, req)
+		return rec.Code
+	}
+	if c := do("GET", "", "", ""); c != 405 {
+		t.Fatalf("GET: %d", c)
+	}
+	// «простой» кросс-сайтовый POST (форма): нет ни JSON, ни своего заголовка
+	if c := do("POST", "text/plain", "", `{"id":"x1"}`); c != 403 {
+		t.Fatalf("без заголовков: %d", c)
+	}
+	if c := do("POST", "application/json", "", `{"id":"x1"}`); c != 403 {
+		t.Fatalf("без X-GPU-Router: %d", c)
+	}
+	if c := do("POST", "application/json", "1", `{}`); c != 400 {
+		t.Fatalf("без id: %d", c)
+	}
+	if c := do("POST", "application/json", "1", `{"id":"x1"}`); c != 200 {
+		t.Fatalf("штатный вызов: %d", c)
+	}
+	no := false
+	s.Config.Dashboard.AllowCancel = &no
+	regTask(s, "llama", "m", "x2", stQueued)
+	if c := do("POST", "application/json", "1", `{"id":"x2"}`); c != 403 {
+		t.Fatalf("при allow_cancel=false: %d", c)
+	}
+}
+
+func TestKickedClientGetsError(t *testing.T) {
+	cfg := &Config{}
+	applyDefaults(cfg)
+	s := NewServer(cfg) // воркера нет: задача так и лежит в очереди
+	h := loggingMW("LLAMA", s.gpuTask("llama"))
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	req.RemoteAddr = "192.168.1.5:1234"
+	rec := httptest.NewRecorder()
+	finished := make(chan struct{})
+	go func() { h.ServeHTTP(rec, req); close(finished) }()
+
+	waitFor(t, "task registered", func() bool { return len(s.listTasks()) == 1 })
+	ts := s.listTasks()
+	if ts[0].State != "queued" || ts[0].Client != "192.168.1.5" || ts[0].Model != "m" {
+		t.Fatalf("карточка задачи: %+v", ts[0])
+	}
+	if code, _ := s.cancelTask(ts[0].ID, "test"); code != 200 {
+		t.Fatalf("cancel: %d", code)
+	}
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("обработчик не завершился после снятия")
+	}
+	if rec.Code != 503 || !strings.Contains(rec.Body.String(), "снят") {
+		t.Fatalf("клиент должен получить понятную ошибку: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(s.listTasks()) != 0 || s.queueLen() != 0 {
+		t.Fatal("после снятия задача должна пропасть из реестра")
 	}
 }

@@ -121,6 +121,7 @@ a { color: inherit; }
 .panel[data-state="down"] .badge { background: transparent; color: var(--bad); border: 1px solid var(--bad); }
 @media (prefers-color-scheme: dark) {
   .panel[data-state="busy"] .badge { color: #14110a; }
+  .q-row[data-state="running"] .qbadge { color: #14110a; }
 }
 .panel .detail { margin-top: 12px; min-height: 3em; color: var(--ink); }
 .panel .detail small { display: block; color: var(--muted); font-size: 14px; margin-top: 2px; word-break: break-word; }
@@ -137,6 +138,23 @@ a { color: inherit; }
 .bar > i { display: block; height: 100%; width: 0; background: var(--accent, var(--ink)); border-radius: 999px; transition: width .5s ease; }
 .bar.warn > i { background: var(--warn); }
 .bar.bad > i { background: var(--bad); }
+
+/* ---- queue ---- */
+.queue { list-style: none; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+.q-row { display: grid; grid-template-columns: auto 1fr auto; gap: 14px; align-items: center; padding: 12px 18px; border-top: 1px solid var(--line); }
+.q-row:first-child { border-top: 0; }
+.q-row[data-svc="comfyui"] { --accent: var(--comfy); }
+.q-row[data-svc="llama"] { --accent: var(--llama); }
+.q-empty { padding: 16px 18px; color: var(--muted); }
+.qbadge { font-size: 13px; font-weight: 600; padding: 3px 11px; border-radius: 999px; background: var(--track); color: var(--muted); white-space: nowrap; min-width: 6.5em; text-align: center; }
+.q-row[data-state="running"] .qbadge { background: var(--accent, var(--ink)); color: #fff; }
+.q-row[data-state="preparing"] .qbadge { background: transparent; color: var(--ink); outline: 2px dashed var(--muted); outline-offset: -2px; }
+.qname { font-weight: 600; word-break: break-word; }
+.qmeta { color: var(--muted); font-size: 14px; word-break: break-word; }
+.qbtn { font: inherit; font-size: 14px; padding: 5px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); cursor: pointer; white-space: nowrap; }
+.qbtn:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
+.qbtn:disabled { opacity: .5; cursor: default; }
+@media (max-width: 520px) { .q-row { grid-template-columns: 1fr auto; } .q-row .qbadge { grid-column: 1 / -1; justify-self: start; } }
 
 /* ---- memory ---- */
 section { margin-top: 36px; }
@@ -208,6 +226,11 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
   </div>
 
   <section>
+    <h2 data-i18n="qHeading"></h2>
+    <ul class="queue" id="queue"></ul>
+  </section>
+
+  <section>
     <h2 data-i18n="memHeading"></h2>
     <div class="mem" id="mem"></div>
   </section>
@@ -266,6 +289,12 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
       ramAvail: 'RAM available', vramUsed: 'VRAM used', gttUsed: 'GTT used (shared RAM)',
       noMemData: 'Memory data is unavailable.',
       up: 'up · {ms} ms', down: 'unavailable',
+      qHeading: 'Queue', qNone: 'No tasks right now.',
+      stRunning: 'Running', stPreparing: 'Switching', stWaiting: 'Waiting', stQueued: 'In queue',
+      qWaitingFor: 'waiting {d}', qRunningFor: 'running {d}', kb: 'KB', mb: 'MB',
+      qRemove: 'Remove', qStop: 'Stop',
+      qConfirmStop: 'Stop the running request? The client will get an interrupted response.',
+      qFailed: 'Could not remove the task: ',
       other: 'Русский',
       nouns: { tasks: ['task', 'tasks'], requests: ['request', 'requests'], tokens: ['token', 'tokens'] }
     },
@@ -296,6 +325,12 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
       ramAvail: 'ОЗУ доступно', vramUsed: 'VRAM занято', gttUsed: 'GTT занято (общая ОЗУ)',
       noMemData: 'Данные о памяти недоступны.',
       up: 'работает · {ms} мс', down: 'недоступен',
+      qHeading: 'Очередь', qNone: 'Сейчас задач нет.',
+      stRunning: 'Идёт', stPreparing: 'Переключение', stWaiting: 'Ждёт', stQueued: 'В очереди',
+      qWaitingFor: 'ждёт {d}', qRunningFor: 'идёт {d}', kb: 'КБ', mb: 'МБ',
+      qRemove: 'Убрать', qStop: 'Остановить',
+      qConfirmStop: 'Остановить идущий запрос? Клиент получит оборванный ответ.',
+      qFailed: 'Не удалось снять задачу: ',
       other: 'English',
       nouns: { tasks: ['задача', 'задачи', 'задач'], requests: ['запрос', 'запроса', 'запросов'], tokens: ['токен', 'токена', 'токенов'] }
     }
@@ -390,6 +425,7 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
     panel('llama', d.llama, scale, d);
     memory(d);
     services(d.services || []);
+    renderQueue(d);
 
     var when = new Date(d.time * 1000);
     $('updated').textContent = tr('updatedAt', { time: when.toLocaleTimeString(lang === 'ru' ? 'ru-RU' : 'en-GB') });
@@ -474,6 +510,71 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
     if (sec < 60) return a.s.replace('{n}', sec);
     if (sec < 3600) return a.min.replace('{n}', Math.floor(sec / 60));
     return a.h.replace('{n}', Math.floor(sec / 3600));
+  }
+
+  // ---- queue ----
+  var queueSig = '';
+  function fmtSize(kb) { return kb >= 1024 ? (kb / 1024).toFixed(1) + ' ' + tr('mb') : kb + ' ' + tr('kb'); }
+  function ageText(t) { return tr(t.state === 'running' ? 'qRunningFor' : 'qWaitingFor', { d: fmtDur(t.age_sec) }); }
+
+  function cancelTask(t, btn) {
+    if (t.state === 'running' && !confirm(tr('qConfirmStop'))) return;
+    btn.disabled = true;
+    fetch('/api/queue/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-GPU-Router': '1' },
+      body: JSON.stringify({ id: t.id })
+    })
+      .then(function (r) { return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, msg: j.message || '' }; }); })
+      .then(function (res) { if (!res.ok) alert(tr('qFailed') + res.msg); })
+      .catch(function () { alert(tr('qFailed')); })
+      .then(function () { clearTimeout(timer); poll(); });
+  }
+
+  function renderQueue(d) {
+    var list = $('queue'), tasks = d.tasks || [];
+    // Список перестраиваем только при изменении состава: иначе нажатие кнопки могло бы потеряться.
+    var sig = lang + '|' + tasks.map(function (t) { return t.id + ':' + t.state + ':' + ((d.cancel_enabled && t.can_cancel) ? 1 : 0); }).join('|');
+    if (sig !== queueSig) {
+      queueSig = sig;
+      list.textContent = '';
+      if (!tasks.length) {
+        var e = document.createElement('li'); e.className = 'q-empty'; e.textContent = tr('qNone'); list.appendChild(e);
+      }
+      tasks.forEach(function (t) {
+        var li = document.createElement('li');
+        li.className = 'q-row'; li.setAttribute('data-svc', t.service); li.setAttribute('data-state', t.state);
+
+        var badge = document.createElement('span'); badge.className = 'qbadge';
+        badge.textContent = tr({ running: 'stRunning', preparing: 'stPreparing', waiting: 'stWaiting', queued: 'stQueued' }[t.state] || 'stQueued');
+
+        var main = document.createElement('div');
+        var name = document.createElement('div'); name.className = 'qname';
+        name.textContent = NAMES[t.service] + (t.model ? ' · ' + t.model : '');
+        var meta = document.createElement('div'); meta.className = 'qmeta';
+        var parts = [];
+        if (t.client) parts.push(t.client);
+        if (t.size_kb > 0) parts.push(fmtSize(t.size_kb));
+        meta.appendChild(document.createTextNode(parts.join(' · ') + (parts.length ? ' · ' : '')));
+        var age = document.createElement('span'); age.id = 'age-' + t.id; age.className = 'num'; age.textContent = ageText(t);
+        meta.appendChild(age);
+        main.appendChild(name); main.appendChild(meta);
+
+        li.appendChild(badge); li.appendChild(main);
+        if (d.cancel_enabled && t.can_cancel) {
+          var btn = document.createElement('button');
+          btn.type = 'button'; btn.className = 'qbtn';
+          btn.textContent = tr(t.state === 'running' ? 'qStop' : 'qRemove');
+          btn.addEventListener('click', function () { cancelTask(t, btn); });
+          li.appendChild(btn);
+        }
+        list.appendChild(li);
+      });
+    }
+    tasks.forEach(function (t) {
+      var el = document.getElementById('age-' + t.id);
+      if (el) el.textContent = ageText(t);
+    });
   }
 
   function meterRow(label, valueText, pct, level) {

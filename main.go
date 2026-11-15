@@ -71,6 +71,9 @@ type Config struct {
 		Port       int           `yaml:"port"`        // 0 = 8190, -1 = выключить
 		ListenHost string        `yaml:"listen_host"` // по умолчанию 127.0.0.1 (к нему ходит Caddy)
 		Services   []DashService `yaml:"services"`    // пусто = набор по умолчанию
+		// AllowCancel: можно ли снимать задачи с очереди со страницы состояния (по умолчанию да).
+		// У страницы нет авторизации: кто достучится до неё по сети, тот сможет снять задачу.
+		AllowCancel *bool `yaml:"allow_cancel"`
 	} `yaml:"dashboard"`
 	Logging struct {
 		Verbose  *bool `yaml:"verbose"`   // false = только важное; по умолчанию true
@@ -289,6 +292,11 @@ type Task struct {
 	Err        error
 	PromptID   string
 	Model      string // llama: значение поля "model" из тела запроса
+
+	ID     string       // короткий номер задачи для страницы состояния
+	Client string       // кто прислал запрос (для показа)
+	state  atomic.Int32 // stQueued / stWaiting / stPreparing / stRunning, см. tasks.go
+	kicked atomic.Bool  // снята вручную со страницы состояния
 }
 
 // abandoned — задача уже не нужна (клиент ушёл / обработчик завершился).
@@ -344,7 +352,9 @@ type Server struct {
 	dash   dashCache  // кэш снимка для страницы состояния
 	tokens tokenMeter // скорость генерации llama (токенов/с), см. tokens.go
 
-	admitWaiting atomic.Int32 // сколько задач воркер держит в admit() в ожидании (см. parallel.go)
+	tasksMu sync.Mutex       // реестр задач для страницы состояния (см. tasks.go)
+	tasks   map[string]*Task // живые задачи по номеру
+	taskSeq atomic.Uint64
 
 	modeOnce sync.Once
 	mode     string // выбранный источник данных о VRAM
@@ -757,11 +767,14 @@ func (s *Server) gpuTask(service string) http.HandlerFunc {
 		if service == "llama" {
 			t.Model = requestModel(body)
 		}
+		t.ID, t.Client = s.nextTaskID(), clientAddr(r)
+		s.register(t)
 		// Done закрываем только после cancel: воркер не должен принять
 		// уже умершую задачу за живую.
 		defer func() {
 			cancel()
 			close(t.Done)
+			s.unregister(t)
 		}()
 
 		select {
@@ -780,11 +793,18 @@ func (s *Server) gpuTask(service string) http.HandlerFunc {
 				s.jsonError(w, http.StatusBadGateway, "не удалось подготовить GPU: "+t.Err.Error())
 			} else if ctx.Err() == nil {
 				s.execBackend(t)
+				s.kickedReply(w, t)
+			} else if t.kicked.Load() {
+				s.kickedReply(w, t)
 			} else {
 				log.Printf("[Queue] %s: клиент ушёл в момент очереди", s.name(service))
 			}
 		case <-ctx.Done():
-			log.Printf("[Queue] %s: клиент отключился, пропускаем", s.name(service))
+			if t.kicked.Load() {
+				s.kickedReply(w, t)
+			} else {
+				log.Printf("[Queue] %s: клиент отключился, пропускаем", s.name(service))
+			}
 		case <-timer.C:
 			s.jsonError(w, http.StatusGatewayTimeout, "таймаут ожидания в очереди")
 		}
@@ -816,12 +836,15 @@ func (s *Server) comfyPromptAsync(w http.ResponseWriter, r *http.Request, body [
 		Done:       make(chan struct{}),
 		PromptID:   promptID,
 	}
+	t.ID, t.Client = s.nextTaskID(), clientAddr(r)
+	s.register(t)
 
 	select {
 	case s.taskQueue <- t:
 		s.vlogf("[Queue] ComfyUI в очереди (размер: %d, prompt_id: %s)", len(s.taskQueue), promptID)
 	default:
 		cancel()
+		s.unregister(t)
 		log.Printf("[Queue] ComfyUI: очередь переполнена, prompt_id: %s", promptID)
 		// Формат ошибки ComfyUI — фронт покажет сообщение, а не «успех» с пустой историей.
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -861,6 +884,7 @@ func (s *Server) runComfyTask(t *Task) {
 	defer func() {
 		t.Cancel()
 		close(t.Done)
+		s.unregister(t)
 	}()
 
 	timer := time.NewTimer(time.Duration(s.Config.Queue.WaitTimeout) * time.Second)
@@ -947,6 +971,7 @@ func (s *Server) worker() {
 		if s.admit(t) {
 			continue
 		}
+		t.state.Store(stPreparing)
 
 		// Передача GPU идёт под opMu — watchdog в это время ничего не трогает.
 		s.opMu.Lock()
@@ -979,6 +1004,9 @@ func (s *Server) worker() {
 			s.activeReady = true
 			s.activeSince = time.Now() // отсчёт «работает уже N» — с момента выдачи GPU
 			s.mu.Unlock()
+		}
+		if prepErr == nil {
+			t.state.Store(stRunning)
 		}
 		close(t.Turn)
 

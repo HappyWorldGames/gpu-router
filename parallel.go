@@ -74,13 +74,6 @@ func (s *Server) memTooLowToJoin() (bool, int) {
 	return avail < min, avail
 }
 
-// queueLen — сколько задач ждёт своей очереди: лежат в очереди и ещё та, которую воркер
-// уже взял и держит в admit() (ждёт слот или конца идущих). Без неё казалось бы, что
-// очередь пуста, хотя за идущим запросом кто-то стоит.
-func (s *Server) queueLen() int {
-	return len(s.taskQueue) + int(s.admitWaiting.Load())
-}
-
 // someoneWaits — за идущей задачей кто-то ждёт своей очереди: либо лежит в очереди,
 // либо воркер уже взял его и держит в admit() (ждёт слот или конец идущих запросов).
 func (s *Server) someoneWaits() bool {
@@ -153,11 +146,6 @@ func (s *Server) admit(t *Task) bool {
 	defer s.mu.Unlock()
 	logged := false
 	memLogged := false
-	defer func() {
-		if logged {
-			s.admitWaiting.Add(-1)
-		}
-	}()
 	for {
 		if t.abandoned() {
 			log.Printf("[Queue] %s: клиент ушёл, пропускаем", s.name(t.Service))
@@ -179,6 +167,7 @@ func (s *Server) admit(t *Task) bool {
 				s.llamaInflight++
 				n := s.llamaInflight
 				start := time.Now()
+				t.state.Store(stRunning)
 				close(t.Turn)
 				go s.watchLlama(t, start, 0)
 				log.Printf("[Start] LLAMA — параллельно с идущими (%d из %d слотов), ждал %v, модель %s%s",
@@ -188,7 +177,7 @@ func (s *Server) admit(t *Task) bool {
 		}
 		if !logged {
 			logged = true
-			s.admitWaiting.Add(1)
+			t.state.Store(stWaiting)
 			if t.Service == "llama" && t.Model == s.llamaModel && t.Model != "" {
 				s.vlogf("[Queue] LLAMA ждёт свободный слот модели %s (занято %d из %d)", t.Model, s.llamaInflight, s.llamaLimit)
 			} else {

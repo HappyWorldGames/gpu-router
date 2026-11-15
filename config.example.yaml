@@ -70,6 +70,9 @@ gpu:
 dashboard:
   port: 8190                   # -1 = disabled
   listen_host: "127.0.0.1"     # Caddy on the same machine connects here
+  # Allow removing tasks from the queue (and stopping a running llama request) from the status page.
+  # The page has no authentication: anyone who can reach it over the network can remove tasks.
+  allow_cancel: true
   services:                    # shown in the "Services" list; addr is checked over TCP
     - { name: "Open WebUI", addr: "127.0.0.1:3000", url: "https://openwebui.home", desc: "Chat with models" }
     - { name: "ComfyUI",    addr: "127.0.0.1:8288", url: "https://comfyui.home",   desc: "Images and video" }
