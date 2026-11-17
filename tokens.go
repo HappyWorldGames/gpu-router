@@ -15,8 +15,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"log"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // tokenMeter — общий счётчик по всем запросам llama (их может быть несколько
@@ -42,6 +44,7 @@ const (
 type tokenFeed struct {
 	m       *tokenMeter
 	pending []byte
+	sink    *liveText // nil = живой текст выключен: разбирать содержимое чанков не нужно
 }
 
 func (m *tokenMeter) newFeed() *tokenFeed { return &tokenFeed{m: m} }
@@ -54,7 +57,7 @@ func (f *tokenFeed) feed(p []byte) {
 		if i < 0 {
 			break
 		}
-		f.m.line(f.pending[:i])
+		f.m.line(f.pending[:i], f.sink)
 		f.pending = f.pending[i+1:]
 	}
 	if len(f.pending) > tokMaxLine {
@@ -66,12 +69,12 @@ func (f *tokenFeed) feed(p []byte) {
 // (не-стримовый ответ llama — это один JSON без \n).
 func (f *tokenFeed) end() {
 	if len(f.pending) > 0 {
-		f.m.line(f.pending)
+		f.m.line(f.pending, f.sink)
 		f.pending = f.pending[:0]
 	}
 }
 
-func (m *tokenMeter) line(b []byte) {
+func (m *tokenMeter) line(b []byte, sink *liveText) {
 	b = bytes.TrimSpace(b)
 	b = bytes.TrimPrefix(b, []byte("data:"))
 	b = bytes.TrimSpace(b)
@@ -105,6 +108,9 @@ func (m *tokenMeter) line(b []byte) {
 		return
 	}
 	if hasText(b) {
+		if sink != nil {
+			sink.addChunk(b)
+		}
 		now := time.Now()
 		m.mu.Lock()
 		m.stamps = append(m.stamps, now)
@@ -113,6 +119,90 @@ func (m *tokenMeter) line(b []byte) {
 		}
 		m.mu.Unlock()
 	}
+}
+
+// liveText — хвост генерируемого текста одного запроса для страницы состояния.
+// Включается настройкой dashboard.show_text; добавление — микросекунды на токен.
+type liveText struct {
+	mu       sync.Mutex
+	buf      []byte // последние байты текста (с запасом)
+	cut      bool   // раньше был ещё текст, который уже отброшен
+	thinking bool   // последний фрагмент был «рассуждением» модели
+	max      int    // сколько последних символов показывать
+}
+
+func newLiveText(maxRunes int) *liveText {
+	if maxRunes < 40 {
+		maxRunes = 40
+	}
+	if maxRunes > 2000 {
+		maxRunes = 2000
+	}
+	return &liveText{max: maxRunes}
+}
+
+// addChunk достаёт текст из одного чанка потока llama-server (OpenAI-формат или родной /completion).
+func (l *liveText) addChunk(b []byte) {
+	var v struct {
+		Content string `json:"content"`
+		Choices []struct {
+			Delta struct {
+				Content   string `json:"content"`
+				Reasoning string `json:"reasoning_content"`
+			} `json:"delta"`
+			Text string `json:"text"`
+		} `json:"choices"`
+	}
+	if json.Unmarshal(b, &v) != nil {
+		return
+	}
+	text, thinking := v.Content, false
+	if len(v.Choices) > 0 {
+		c := v.Choices[0]
+		switch {
+		case c.Delta.Content != "":
+			text = c.Delta.Content
+		case c.Delta.Reasoning != "":
+			text, thinking = c.Delta.Reasoning, true
+		case c.Text != "":
+			text = c.Text
+		}
+	}
+	if text == "" {
+		return
+	}
+	l.mu.Lock()
+	l.buf = append(l.buf, text...)
+	l.thinking = thinking
+	// держим не больше 4 байт на символ показа (UTF-8) и режем только по границе символа
+	if limit := l.max * 4; len(l.buf) > 2*limit {
+		l.cut = true
+		keep := l.buf[len(l.buf)-limit:]
+		for len(keep) > 0 && !utf8.RuneStart(keep[0]) {
+			keep = keep[1:]
+		}
+		l.buf = append(l.buf[:0], keep...)
+	}
+	l.mu.Unlock()
+}
+
+// snapshot — последние символы текста (с «…» в начале, если это не всё) и признак рассуждения.
+func (l *liveText) snapshot() (string, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.buf) == 0 {
+		return "", false
+	}
+	r := []rune(string(l.buf))
+	more := l.cut
+	if len(r) > l.max {
+		r, more = r[len(r)-l.max:], true
+	}
+	text := strings.TrimLeft(string(r), "\n ")
+	if more {
+		text = "…" + text
+	}
+	return text, l.thinking
 }
 
 // hasText: в чанке есть непустой content / reasoning_content.

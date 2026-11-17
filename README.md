@@ -172,6 +172,10 @@ The "Queue" block of the status page shows what is going on right now: running r
 - **Stop** (with a confirmation) aborts a running llama request; the generation is cancelled on the backend side.
 - A running ComfyUI generation cannot be stopped from here (stop it in ComfyUI). A ComfyUI prompt removed from the queue simply never runs: ComfyUI's own page keeps showing it as pending.
 
+**Where a request came from.** Besides the IP address, a row can show a name you give it (`dashboard.clients`: exact addresses or subnets, e.g. `172.17.0.0/16: Docker`), otherwise the host name from reverse DNS (looked up in the background and cached; `resolve_hostnames: false` turns it off), the application guessed from the `User-Agent` (browser, aiohttp, curl, ...; hover the line to see the full string), and the endpoint if it is not the usual chat one.
+
+**Live text.** With `dashboard.show_text: true` a running llama request also shows the last `text_chars` characters (240 by default) it has generated, updated with every poll; "thinking" output of reasoning models is marked in italics. It is **off by default**: the page has no authentication, so anyone who can open it would see the text of your conversations. The cost is small: the proxy already scans the response stream, and extracting the text adds about 3 µs per streamed chunk (measured with `go test -bench Feed`), against tens of milliseconds between tokens; memory is a few hundred bytes per running request. Nothing is parsed or stored while the option is off. Only streamed responses are shown.
+
 Removal is a `POST /api/queue/cancel` with `{"id": "..."}`, and it requires the headers `Content-Type: application/json` and `X-GPU-Router: 1`, so a page on another site cannot trigger it from your browser. There is still **no authentication**: anyone who can reach the status page over the network can remove tasks. Set `dashboard.allow_cancel: false` to make the page read-only.
 
 ## Endpoints

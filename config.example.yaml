@@ -73,6 +73,16 @@ dashboard:
   # Allow removing tasks from the queue (and stopping a running llama request) from the status page.
   # The page has no authentication: anyone who can reach it over the network can remove tasks.
   allow_cancel: true
+  # Friendly names for client addresses/subnets shown in the queue (exact address beats a subnet,
+  # a narrower subnet beats a wider one). Without a name, the page asks DNS (resolve_hostnames).
+  clients:
+    "192.168.1.50": "Desktop PC"
+    "172.17.0.0/16": "Docker (Open WebUI, n8n)"
+  resolve_hostnames: true
+  # Show the tail of the text llama is generating right now under each running request.
+  # OFF by default: the page has no authentication and generated text is often private.
+  show_text: false
+  text_chars: 240               # how many last characters to show
   services:                    # shown in the "Services" list; addr is checked over TCP
     - { name: "Open WebUI", addr: "127.0.0.1:3000", url: "https://openwebui.home", desc: "Chat with models" }
     - { name: "ComfyUI",    addr: "127.0.0.1:8288", url: "https://comfyui.home",   desc: "Images and video" }

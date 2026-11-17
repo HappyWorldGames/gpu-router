@@ -74,6 +74,20 @@ type Config struct {
 		// AllowCancel: можно ли снимать задачи с очереди со страницы состояния (по умолчанию да).
 		// У страницы нет авторизации: кто достучится до неё по сети, тот сможет снять задачу.
 		AllowCancel *bool `yaml:"allow_cancel"`
+		// Clients: свои названия для адресов и подсетей на странице: "192.168.1.5": "Ноутбук",
+		// "172.17.0.0/16": "Docker". Точный адрес важнее подсети, узкая подсеть важнее широкой.
+		Clients map[string]string `yaml:"clients"`
+		// ResolveHostnames: если для адреса нет своего названия, спросить имя у DNS (в фоне, с кэшем).
+		// По умолчанию включено.
+		ResolveHostnames *bool `yaml:"resolve_hostnames"`
+		// DockerSocket: путь к сокету Docker (обычно /var/run/docker.sock). Если задан, адреса
+		// контейнеров показываются именами сервисов, даже когда адрес меняется при пересоздании.
+		// Только чтение списка контейнеров; нужен доступ к сокету. Пусто = выключено.
+		DockerSocket string `yaml:"docker_socket"`
+		// ShowText: показывать на странице хвост текста, который llama генерирует прямо сейчас.
+		// По умолчанию ВЫКЛЮЧЕНО: у страницы нет авторизации, а текст ответов бывает личным.
+		ShowText  bool `yaml:"show_text"`
+		TextChars int  `yaml:"text_chars"` // сколько последних символов показывать (по умолчанию 240)
 	} `yaml:"dashboard"`
 	Logging struct {
 		Verbose  *bool `yaml:"verbose"`   // false = только важное; по умолчанию true
@@ -209,6 +223,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.GPU.NvidiaSMI == "" {
 		cfg.GPU.NvidiaSMI = "nvidia-smi"
 	}
+	if cfg.Dashboard.TextChars == 0 {
+		cfg.Dashboard.TextChars = 240
+	}
 	if cfg.Dashboard.Port == 0 {
 		cfg.Dashboard.Port = 8190
 	}
@@ -295,6 +312,8 @@ type Task struct {
 
 	ID     string       // короткий номер задачи для страницы состояния
 	Client string       // кто прислал запрос (для показа)
+	UA     string       // User-Agent клиента (для показа приложения)
+	Live   *liveText    // хвост генерируемого текста (nil, если show_text выключен)
 	state  atomic.Int32 // stQueued / stWaiting / stPreparing / stRunning, см. tasks.go
 	kicked atomic.Bool  // снята вручную со страницы состояния
 }
@@ -352,6 +371,11 @@ type Server struct {
 	dash   dashCache  // кэш снимка для страницы состояния
 	tokens tokenMeter // скорость генерации llama (токенов/с), см. tokens.go
 
+	clientExact map[string]string // свои названия клиентов: точные адреса (см. tasks.go)
+	clientNets  []clientRule      // и подсети
+	rdns        rdnsCache         // имена хостов из DNS
+	docker      dockerNames       // имена контейнеров Docker (см. docker_names.go)
+
 	tasksMu sync.Mutex       // реестр задач для страницы состояния (см. tasks.go)
 	tasks   map[string]*Task // живые задачи по номеру
 	taskSeq atomic.Uint64
@@ -372,6 +396,7 @@ func NewServer(cfg *Config) *Server {
 		ini:       newModelsINI(cfg.LLAMA.ModelsINI),
 	}
 	s.cond = sync.NewCond(&s.mu)
+	s.initClients()
 	return s
 }
 
@@ -767,7 +792,10 @@ func (s *Server) gpuTask(service string) http.HandlerFunc {
 		if service == "llama" {
 			t.Model = requestModel(body)
 		}
-		t.ID, t.Client = s.nextTaskID(), clientAddr(r)
+		t.ID, t.Client, t.UA = s.nextTaskID(), clientAddr(r), clipUA(r.UserAgent())
+		if service == "llama" && s.Config.Dashboard.ShowText {
+			t.Live = newLiveText(s.Config.Dashboard.TextChars)
+		}
 		s.register(t)
 		// Done закрываем только после cancel: воркер не должен принять
 		// уже умершую задачу за живую.
@@ -836,7 +864,7 @@ func (s *Server) comfyPromptAsync(w http.ResponseWriter, r *http.Request, body [
 		Done:       make(chan struct{}),
 		PromptID:   promptID,
 	}
-	t.ID, t.Client = s.nextTaskID(), clientAddr(r)
+	t.ID, t.Client, t.UA = s.nextTaskID(), clientAddr(r), clipUA(r.UserAgent())
 	s.register(t)
 
 	select {
@@ -2212,6 +2240,7 @@ func (s *Server) execBackend(t *Task) int {
 	var meter *tokenFeed
 	if t.Service == "llama" {
 		meter = s.tokens.newFeed()
+		meter.sink = t.Live
 		defer meter.end()
 	}
 	for {

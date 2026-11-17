@@ -7,6 +7,7 @@ package main
 // и удаляется, когда её обработчик завершился.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -88,12 +90,158 @@ func (s *Server) queueLen() int {
 	return n
 }
 
+// ---- откуда пришёл запрос: название, приложение ----
+
+type clientRule struct {
+	net  *net.IPNet
+	name string
+}
+
+func (s *Server) initClients() {
+	s.clientExact = map[string]string{}
+	s.clientNets = nil
+	for k, name := range s.Config.Dashboard.Clients {
+		k = strings.TrimSpace(k)
+		if strings.Contains(k, "/") {
+			if _, n, err := net.ParseCIDR(k); err == nil {
+				s.clientNets = append(s.clientNets, clientRule{n, name})
+				continue
+			}
+			log.Printf("[Dashboard] dashboard.clients: не понимаю подсеть %q — пропускаю", k)
+			continue
+		}
+		if ip := net.ParseIP(k); ip != nil {
+			s.clientExact[ip.String()] = name
+		} else {
+			log.Printf("[Dashboard] dashboard.clients: не понимаю адрес %q — пропускаю", k)
+		}
+	}
+}
+
+// clientName: своё название адреса (точный адрес), затем имя контейнера Docker, затем
+// самая узкая подсеть из конфига, затем имя из DNS, иначе пусто.
+func (s *Server) clientName(ip string) string {
+	p := net.ParseIP(ip)
+	if p == nil {
+		return ""
+	}
+	if n, ok := s.clientExact[p.String()]; ok {
+		return n
+	}
+	// Имя контейнера от Docker точнее общего названия подсети.
+	if n := s.dockerName(p.String()); n != "" {
+		return n
+	}
+	best, name := -1, ""
+	for _, r := range s.clientNets {
+		if r.net.Contains(p) {
+			if ones, _ := r.net.Mask.Size(); ones > best {
+				best, name = ones, r.name
+			}
+		}
+	}
+	if name != "" {
+		return name
+	}
+	if h := s.Config.Dashboard.ResolveHostnames; h == nil || *h {
+		return s.rdns.lookup(p)
+	}
+	return ""
+}
+
+// rdnsCache — имена хостов из DNS: запрос идёт в фоне, пока его нет — пусто, результат
+// держим 10 минут. Страницу и очередь это не задерживает.
+type rdnsCache struct {
+	mu sync.Mutex
+	m  map[string]rdnsEntry
+}
+
+type rdnsEntry struct {
+	name string
+	at   time.Time
+}
+
+func (c *rdnsCache) lookup(ip net.IP) string {
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return ""
+	}
+	key := ip.String()
+	c.mu.Lock()
+	if c.m == nil {
+		c.m = map[string]rdnsEntry{}
+	}
+	e, ok := c.m[key]
+	if ok && time.Since(e.at) < 10*time.Minute {
+		c.mu.Unlock()
+		return e.name
+	}
+	c.m[key] = rdnsEntry{name: e.name, at: time.Now()} // чтобы не запускать повторно, пока идёт запрос
+	c.mu.Unlock()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+		defer cancel()
+		name := ""
+		if names, err := net.DefaultResolver.LookupAddr(ctx, key); err == nil && len(names) > 0 {
+			name = strings.TrimSuffix(names[0], ".")
+		}
+		c.mu.Lock()
+		c.m[key] = rdnsEntry{name: name, at: time.Now()}
+		c.mu.Unlock()
+	}()
+	return e.name
+}
+
+// clipUA ограничивает длину User-Agent и убирает управляющие символы.
+func clipUA(ua string) string {
+	ua = strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return -1
+		}
+		return r
+	}, ua)
+	if len(ua) > 160 {
+		ua = ua[:160]
+	}
+	return ua
+}
+
+// appFromUA — короткое название приложения по User-Agent: "browser" для браузеров,
+// иначе имя известной библиотеки или первого продукта в строке.
+func appFromUA(ua string) string {
+	l := strings.ToLower(ua)
+	if strings.TrimSpace(l) == "" {
+		return ""
+	}
+	for _, k := range []string{"aiohttp", "python-httpx", "httpx", "python-requests", "curl", "okhttp", "axios", "openai", "litellm", "langchain", "node-fetch", "undici", "go-http-client", "postman"} {
+		if strings.Contains(l, k) {
+			return k
+		}
+	}
+	if strings.Contains(l, "mozilla") || strings.Contains(l, "applewebkit") {
+		return "browser"
+	}
+	first := strings.Fields(ua)[0]
+	if i := strings.IndexByte(first, '/'); i > 0 {
+		first = first[:i]
+	}
+	if len(first) > 24 {
+		first = first[:24]
+	}
+	return first
+}
+
 type dashTask struct {
 	ID        string `json:"id"`
 	Service   string `json:"service"`
 	Model     string `json:"model,omitempty"`
 	State     string `json:"state"` // queued | waiting | preparing | running
 	Client    string `json:"client,omitempty"`
+	Name      string `json:"client_name,omitempty"` // своё название или имя из DNS
+	App       string `json:"app,omitempty"`         // "browser" или имя библиотеки/приложения
+	UA        string `json:"ua,omitempty"`          // полный User-Agent (для подсказки)
+	Path      string `json:"path,omitempty"`
+	Text      string `json:"text,omitempty"`     // хвост генерируемого текста (если включён show_text)
+	Thinking  bool   `json:"thinking,omitempty"` // этот хвост — «рассуждение» модели
 	AgeSec    int    `json:"age_sec"`
 	SizeKB    int    `json:"size_kb"`
 	CanCancel bool   `json:"can_cancel"`
@@ -124,8 +272,15 @@ func (s *Server) listTasks() []dashTask {
 	out := make([]dashTask, 0, len(ts))
 	for _, t := range ts {
 		st := t.state.Load()
+		var text string
+		var thinking bool
+		if t.Live != nil && st == stRunning {
+			text, thinking = t.Live.snapshot()
+		}
 		out = append(out, dashTask{
 			ID: t.ID, Service: t.Service, Model: t.Model, State: stateName(st), Client: t.Client,
+			Name: s.clientName(t.Client), App: appFromUA(t.UA), UA: t.UA, Path: t.Path,
+			Text: text, Thinking: thinking,
 			AgeSec: int(time.Since(t.EnqueuedAt).Seconds()), SizeKB: len(t.Body) / 1024,
 			// Идущую задачу ComfyUI отсюда не прерываем (у неё свой механизм остановки в самом ComfyUI).
 			CanCancel: allowed && !(t.Service == "comfyui" && st == stRunning),
