@@ -5,10 +5,18 @@ After=network.target
 
 [Service]
 Type=simple
+# llama.api_key can come from a file readable only by the service user, e.g.
+#   sudo install -d /etc/gpu-router && echo -n 'YOUR_KEY' | sudo tee /etc/gpu-router/llama.key
+#   sudo chown <service user> /etc/gpu-router/llama.key && sudo chmod 600 /etc/gpu-router/llama.key
+# and then  api_key: "file:/etc/gpu-router/llama.key"  in config.yaml. (Or EnvironmentFile= + "env:NAME".)
 # Needs access to /proc/<pid>/fdinfo of the ComfyUI and llama processes (VRAM accounting)
 # and permission to signal them (eviction). Simplest: run as root, or as the same user
 # that runs both services.
 User=root
+# If you run as a regular user and want Docker container names on the status page
+# (dashboard.docker_socket), give that user access to the socket instead of root:
+# User=youruser
+# SupplementaryGroups=docker
 WorkingDirectory=/opt/gpu-router
 ExecStart=/opt/gpu-router/gpu-router /opt/gpu-router/config.yaml
 Restart=on-failure

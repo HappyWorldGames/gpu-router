@@ -25,6 +25,11 @@ llama:
   # (with the [*] section as default): that many requests may run on an already loaded
   # model at once. Read once at startup. Empty = parallel requests disabled.
   models_ini: ""              # e.g. "/etc/llama/models.ini"
+  # The key the proxy uses to talk to llama-server started with --api-key. Keep it out of this file:
+  # "file:/etc/gpu-router/llama.key" (chmod 600), "env:LLAMA_API_KEY", or the key itself.
+  # It is never sent to ComfyUI and never written to the log. Empty = llama-server has no key.
+  # If the file/variable cannot be read, the proxy refuses to start instead of running without a key.
+  api_key: ""
 
 proxy:
   comfyui_port: 8188
@@ -33,6 +38,14 @@ proxy:
   # via host.docker.internal, "127.0.0.1" would cut them off. In that case keep "" and block
   # the ports with a firewall: the proxy has no authentication of its own.
   listen_host: ""
+  # Require a Bearer key from clients of the llama proxy (Open WebUI, agents, the llama.cpp web UI).
+  # false: the proxy lets everyone in and adds its own key, so protection rests on a firewall.
+  # true: clients must send llama.api_key or one of llama_api_keys, otherwise they get 401 BEFORE
+  # the queue (so an unauthenticated request can never occupy it or make the proxy unload ComfyUI).
+  llama_require_key: false
+  # Extra client keys (optional): hand one to each client and revoke it separately.
+  # Values like api_key: "file:...", "env:...", or the key itself.
+  llama_api_keys: []
 
 queue:
   max_size: 30
@@ -43,6 +56,13 @@ queue:
   # is empty, a request may run as long as it needs.
   exec_idle_timeout: 300       # no data from the backend for this many seconds: abort the request
   task_timeout: 14400          # hard ceiling per task, so the queue cannot get stuck
+  # Keep llama's context cache: after its last request llama holds the GPU for this many more
+  # seconds before handing it to ComfyUI, and agent requests may overtake a waiting ComfyUI task.
+  # 0 = off (ComfyUI gets the GPU as soon as it is next in the queue).
+  llama_hold: 0
+  # Hard cap: the hold never delays a ComfyUI task longer than this many seconds since it was
+  # queued (a llama request that is actually running is not interrupted). -1 = no cap.
+  comfy_max_wait: 3600
 
 gpu:
   release_timeout: 30          # how long to wait for a soft unload before SIGKILL
@@ -62,6 +82,11 @@ gpu:
   # critical_available_mb, -1 = never evict while idle (risk: the kernel OOM killer picks).
   critical_idle_available_mb: 0
   kill_on_leak: true           # false = only log, never kill
+  # Processes MemGuard stops FIRST when RAM is critically low, before touching llama and its cache
+  # (matched by the start of the process name, case-insensitive: "Godot"). SIGTERM, SIGKILL after 2 s.
+  # Containers, the proxy itself and the services' own units are never touched. Unsaved work in
+  # those programs is lost. Empty = off.
+  sacrifice: []
   # VRAM data source: auto | fdinfo (AMD/Intel, from the kernel, no tools needed) | nvidia | none
   backend: "auto"
   nvidia_smi: "nvidia-smi"
@@ -79,6 +104,11 @@ dashboard:
     "192.168.1.50": "Desktop PC"
     "172.17.0.0/16": "Docker (Open WebUI, n8n)"
   resolve_hostnames: true
+  # Docker container names. A container's address changes whenever it is recreated, so a fixed
+  # name in "clients" does not survive. With the Docker socket set, the page shows the compose
+  # service / container name for the client's current address (read-only: lists containers).
+  # Needs access to the socket: run as root or add the service user to the "docker" group.
+  # docker_socket: "/var/run/docker.sock"
   # Show the tail of the text llama is generating right now under each running request.
   # OFF by default: the page has no authentication and generated text is often private.
   show_text: false

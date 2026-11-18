@@ -130,6 +130,26 @@ Rules:
 
 Keep in mind that without `kv-unified`, `ctx-size` is split between the slots, so each request gets a smaller context. Check `total_slots` and the slot context size in your build's `/props`.
 
+## Authentication for llama.cpp (Bearer key)
+
+If `llama-server` runs with `--api-key`, the proxy has to present that key. There are two separate settings:
+
+```yaml
+llama:
+  api_key: "file:/etc/gpu-router/llama.key"   # the key the proxy uses towards llama-server
+proxy:
+  llama_require_key: false                    # require a key from the proxy's own clients?
+  llama_api_keys: []                          # optional extra keys for clients
+```
+
+- **`llama.api_key`** is added to every request the proxy sends to llama-server: its own calls (model list, unload), forwarded client requests, and the reverse proxy for everything else. It is **never sent to ComfyUI** and never written to the log. Use `file:/path` (a file with mode 600, first line is the key), `env:NAME` (an environment variable), or the key itself. If the file or variable cannot be read, the proxy **refuses to start** instead of silently running without a key.
+- **`proxy.llama_require_key`** decides whether clients of the proxy must authenticate. While it is `false`, the proxy lets everyone who can reach its port in and adds its own key, so llama-server's protection rests on a firewall alone (the log and the status page point this out). When it is `true`, a client must send `Authorization: Bearer <key>` with `llama.api_key` or one of `proxy.llama_api_keys`; otherwise it gets an OpenAI-style `401` **before the queue**, so an unauthenticated request can never occupy it or make the proxy unload ComfyUI. Comparison is constant-time, and refused attempts are logged at most once per 10 seconds without the key.
+- **Separate client keys:** give each client (Open WebUI, an agent, n8n) its own key in `llama_api_keys` and revoke one without touching llama-server. The proxy always forwards its own `llama.api_key` to llama-server, whatever key the client used.
+- **What stays public**, as in llama-server itself: `/health`, CORS preflight (`OPTIONS`), and the static files of the web UI (GET requests outside the API paths). Everything else, including `/v1/models`, `/props` and `/slots`, needs the key.
+- If llama-server answers `401`, the log says so (once a minute) and the status page shows "llama-server rejects the proxy key", pointing at `llama.api_key`.
+
+Do not put the key into a file you commit. `*.key` and `config.yaml` are in `.gitignore`.
+
 ## Memory protection and timeouts
 
 | Option | What it does |
@@ -141,6 +161,9 @@ Keep in mind that without `kv-unified`, `ctx-size` is split between the slots, s
 | `queue.task_timeout` | Ceiling for one task. Fires only if someone is waiting behind it. |
 | `queue.exec_idle_timeout` | No data from the backend for this many seconds: abort the request. Also only if someone is waiting. For long contexts set it generously: processing a 90k-token prompt can stay silent for minutes. |
 | `queue.comfy_idle_timeout` | Maximum ComfyUI generation time. |
+| `queue.llama_hold` | Keep llama's context cache: after its last request llama holds the GPU this many seconds before handing it to ComfyUI, and agent requests may overtake a waiting ComfyUI task. 0 = off. |
+| `queue.comfy_max_wait` | Hard cap on that hold: a ComfyUI task is never delayed by it for longer than this many seconds since it was queued (default 3600; a llama request that is actually running is not interrupted). |
+| `gpu.sacrifice` | Process names (prefix match, e.g. `Godot`) that MemGuard stops first when RAM is critically low, before touching llama. Containers, the proxy and the services' own units are never touched. Unsaved work in those programs is lost. |
 
 ## Status page
 
@@ -172,7 +195,7 @@ The "Queue" block of the status page shows what is going on right now: running r
 - **Stop** (with a confirmation) aborts a running llama request; the generation is cancelled on the backend side.
 - A running ComfyUI generation cannot be stopped from here (stop it in ComfyUI). A ComfyUI prompt removed from the queue simply never runs: ComfyUI's own page keeps showing it as pending.
 
-**Where a request came from.** Besides the IP address, a row can show a name you give it (`dashboard.clients`: exact addresses or subnets, e.g. `172.17.0.0/16: Docker`), otherwise the host name from reverse DNS (looked up in the background and cached; `resolve_hostnames: false` turns it off), the application guessed from the `User-Agent` (browser, aiohttp, curl, ...; hover the line to see the full string), and the endpoint if it is not the usual chat one.
+**Where a request came from.** Besides the IP address, a row can show a name you give it (`dashboard.clients`: exact addresses or subnets, e.g. `172.17.0.0/16: Docker`), otherwise the host name from reverse DNS (looked up in the background and cached; `resolve_hostnames: false` turns it off), for Docker clients, the container name taken from Docker itself (`dashboard.docker_socket`, read-only, refreshed automatically, so it survives containers being recreated with new addresses; the service user needs access to the socket: run as root or add it to the `docker` group), the application guessed from the `User-Agent` (browser, aiohttp, curl, ...; hover the line to see the full string), and the endpoint if it is not the usual chat one.
 
 **Live text.** With `dashboard.show_text: true` a running llama request also shows the last `text_chars` characters (240 by default) it has generated, updated with every poll; "thinking" output of reasoning models is marked in italics. It is **off by default**: the page has no authentication, so anyone who can open it would see the text of your conversations. The cost is small: the proxy already scans the response stream, and extracting the text adds about 3 µs per streamed chunk (measured with `go test -bench Feed`), against tens of milliseconds between tokens; memory is a few hundred bytes per running request. Nothing is parsed or stored while the option is off. Only streamed responses are shown.
 

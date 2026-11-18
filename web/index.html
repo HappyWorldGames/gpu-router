@@ -126,6 +126,9 @@ a { color: inherit; }
 .panel .detail { margin-top: 12px; min-height: 3em; color: var(--ink); }
 .panel .detail small { display: block; color: var(--muted); font-size: 14px; margin-top: 2px; word-break: break-word; }
 
+.authnote { margin-top: 10px; font-size: 13px; color: var(--muted); }
+.authnote:empty { display: none; }
+.authnote.warn { color: var(--warn); }
 .speed { margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .speed .big { font-size: 34px; font-weight: 650; line-height: 1; letter-spacing: -0.02em; color: var(--muted); }
 .speed.live .big { color: var(--accent); }
@@ -151,6 +154,9 @@ a { color: inherit; }
 .q-row[data-state="preparing"] .qbadge { background: transparent; color: var(--ink); outline: 2px dashed var(--muted); outline-offset: -2px; }
 .qname { font-weight: 600; word-break: break-word; }
 .qmeta { color: var(--muted); font-size: 14px; word-break: break-word; }
+.qtext { margin-top: 6px; padding-left: 10px; border-left: 3px solid var(--accent, var(--line)); color: var(--muted); font-size: 13px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow: hidden; }
+.qtext.thinking { font-style: italic; }
+.qtext:empty { display: none; }
 .qbtn { font: inherit; font-size: 14px; padding: 5px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--surface); color: var(--ink); cursor: pointer; white-space: nowrap; }
 .qbtn:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
 .qbtn:disabled { opacity: .5; cursor: default; }
@@ -218,6 +224,7 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
       <header><h2>llama.cpp</h2><span class="badge" id="b-llama">…</span></header>
       <div class="detail" id="d-llama"></div>
       <div class="speed" id="s-llama" aria-live="off"></div>
+      <div class="authnote" id="a-llama"></div>
       <div class="meter">
         <div class="row"><span data-i18n="memGPU"></span><span class="num" id="v-llama">—</span></div>
         <div class="bar"><i id="m-llama"></i></div>
@@ -289,10 +296,13 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
       ramAvail: 'RAM available', vramUsed: 'VRAM used', gttUsed: 'GTT used (shared RAM)',
       noMemData: 'Memory data is unavailable.',
       up: 'up · {ms} ms', down: 'unavailable',
+      authError: 'llama-server rejects the proxy key', authErrorHint: 'Check llama.api_key in config.yaml: it must match llama-server --api-key.',
+      authClient: 'Access: an API key is required from clients', authProxy: 'Access: no key required here; the proxy adds its own to llama-server (keep the port behind a firewall)',
       qHeading: 'Queue', qNone: 'No tasks right now.',
       stRunning: 'Running', stPreparing: 'Switching', stWaiting: 'Waiting', stQueued: 'In queue',
       qWaitingFor: 'waiting {d}', qRunningFor: 'running {d}', kb: 'KB', mb: 'MB',
       qRemove: 'Remove', qStop: 'Stop',
+      appBrowser: 'browser', thinking: 'thinking: ',
       qConfirmStop: 'Stop the running request? The client will get an interrupted response.',
       qFailed: 'Could not remove the task: ',
       other: 'Русский',
@@ -325,10 +335,13 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
       ramAvail: 'ОЗУ доступно', vramUsed: 'VRAM занято', gttUsed: 'GTT занято (общая ОЗУ)',
       noMemData: 'Данные о памяти недоступны.',
       up: 'работает · {ms} мс', down: 'недоступен',
+      authError: 'llama-server не принимает ключ прокси', authErrorHint: 'Проверьте llama.api_key в config.yaml: он должен совпадать с --api-key у llama-server.',
+      authClient: 'Доступ: от клиентов требуется API-ключ', authProxy: 'Доступ: ключ здесь не нужен, прокси сам подставляет свой для llama-server (держите порт за файрволом)',
       qHeading: 'Очередь', qNone: 'Сейчас задач нет.',
       stRunning: 'Идёт', stPreparing: 'Переключение', stWaiting: 'Ждёт', stQueued: 'В очереди',
       qWaitingFor: 'ждёт {d}', qRunningFor: 'идёт {d}', kb: 'КБ', mb: 'МБ',
       qRemove: 'Убрать', qStop: 'Остановить',
+      appBrowser: 'браузер', thinking: 'рассуждает: ',
       qConfirmStop: 'Остановить идущий запрос? Клиент получит оборванный ответ.',
       qFailed: 'Не удалось снять задачу: ',
       other: 'English',
@@ -439,7 +452,11 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
     det.textContent = '';
 
     var line = document.createElement('div'), small = document.createElement('small');
-    if (state === 'down') {
+    if (state === 'down' && b.auth_error) {
+      badge.textContent = tr('notResponding');
+      line.textContent = tr('authError');
+      small.textContent = tr('authErrorHint');
+    } else if (state === 'down') {
       badge.textContent = tr('notResponding');
       line.textContent = tr('svcUnavailable');
       small.textContent = tr('restartHint');
@@ -471,7 +488,12 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
     det.appendChild(line);
     if (small.textContent) det.appendChild(small);
 
-    if (key === 'llama') speed(b.speed, b.inflight || 0);
+    if (key === 'llama') {
+      speed(b.speed, b.inflight || 0);
+      var an = $('a-llama');
+      an.textContent = b.auth === 'client' ? tr('authClient') : (b.auth === 'proxy' ? tr('authProxy') : '');
+      an.className = 'authnote' + (b.auth === 'proxy' ? ' warn' : '');
+    }
 
     var mb = b.vram_mb;
     $('v-' + key).textContent = mb == null ? tr('notMeasured') : fmtMB(mb);
@@ -553,12 +575,18 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
         name.textContent = NAMES[t.service] + (t.model ? ' · ' + t.model : '');
         var meta = document.createElement('div'); meta.className = 'qmeta';
         var parts = [];
-        if (t.client) parts.push(t.client);
+        if (t.client_name && t.client) parts.push(t.client_name + ' (' + t.client + ')');
+        else if (t.client_name || t.client) parts.push(t.client_name || t.client);
+        if (t.app) parts.push(t.app === 'browser' ? tr('appBrowser') : t.app);
+        if (t.path && t.path !== '/v1/chat/completions' && t.path !== '/prompt' && t.path !== '/api/prompt') parts.push(t.path);
         if (t.size_kb > 0) parts.push(fmtSize(t.size_kb));
+        if (t.ua) meta.title = t.ua;
         meta.appendChild(document.createTextNode(parts.join(' · ') + (parts.length ? ' · ' : '')));
         var age = document.createElement('span'); age.id = 'age-' + t.id; age.className = 'num'; age.textContent = ageText(t);
         meta.appendChild(age);
         main.appendChild(name); main.appendChild(meta);
+        var txt = document.createElement('div'); txt.id = 'txt-' + t.id; txt.className = 'qtext';
+        main.appendChild(txt);
 
         li.appendChild(badge); li.appendChild(main);
         if (d.cancel_enabled && t.can_cancel) {
@@ -574,6 +602,12 @@ footer button { background: none; border: 0; color: inherit; font: inherit; curs
     tasks.forEach(function (t) {
       var el = document.getElementById('age-' + t.id);
       if (el) el.textContent = ageText(t);
+      // Живой текст обновляем на месте, не перестраивая строку (иначе кнопка «дрожала» бы).
+      var tx = document.getElementById('txt-' + t.id);
+      if (tx) {
+        tx.textContent = t.text ? (t.thinking ? tr('thinking') : '') + t.text : '';
+        tx.className = 'qtext' + (t.thinking ? ' thinking' : '');
+      }
     });
   }
 

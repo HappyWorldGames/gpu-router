@@ -240,8 +240,10 @@ type dashTask struct {
 	App       string `json:"app,omitempty"`         // "browser" или имя библиотеки/приложения
 	UA        string `json:"ua,omitempty"`          // полный User-Agent (для подсказки)
 	Path      string `json:"path,omitempty"`
-	Text      string `json:"text,omitempty"`     // хвост генерируемого текста (если включён show_text)
-	Thinking  bool   `json:"thinking,omitempty"` // этот хвост — «рассуждение» модели
+	Text      string `json:"text,omitempty"`       // хвост генерируемого текста (если включён show_text)
+	Thinking  bool   `json:"thinking,omitempty"`   // этот хвост — «рассуждение» модели
+	Reason    string `json:"reason,omitempty"`     // почему ждёт: hold | slot | drain | mem
+	ReasonSec int    `json:"reason_sec,omitempty"` // hold: сколько ещё секунд до жёсткого предела ожидания
 	AgeSec    int    `json:"age_sec"`
 	SizeKB    int    `json:"size_kb"`
 	CanCancel bool   `json:"can_cancel"`
@@ -272,6 +274,16 @@ func (s *Server) listTasks() []dashTask {
 	out := make([]dashTask, 0, len(ts))
 	for _, t := range ts {
 		st := t.state.Load()
+		var reason string
+		var reasonSec int
+		if st == stQueued || st == stWaiting {
+			reason = reasonName(t.reason.Load())
+			if reason == "hold" {
+				if left, capped := s.capLeft(t); capped {
+					reasonSec = int(left.Seconds())
+				}
+			}
+		}
 		var text string
 		var thinking bool
 		if t.Live != nil && st == stRunning {
@@ -280,7 +292,7 @@ func (s *Server) listTasks() []dashTask {
 		out = append(out, dashTask{
 			ID: t.ID, Service: t.Service, Model: t.Model, State: stateName(st), Client: t.Client,
 			Name: s.clientName(t.Client), App: appFromUA(t.UA), UA: t.UA, Path: t.Path,
-			Text: text, Thinking: thinking,
+			Text: text, Thinking: thinking, Reason: reason, ReasonSec: reasonSec,
 			AgeSec: int(time.Since(t.EnqueuedAt).Seconds()), SizeKB: len(t.Body) / 1024,
 			// Идущую задачу ComfyUI отсюда не прерываем (у неё свой механизм остановки в самом ComfyUI).
 			CanCancel: allowed && !(t.Service == "comfyui" && st == stRunning),

@@ -25,6 +25,7 @@ type modelsINI struct {
 
 func newModelsINI(path string) *modelsINI {
 	if strings.TrimSpace(path) == "" {
+		log.Printf("[Parallel] llama.models_ini не задан в конфиге — запросы к llama идут строго по одному")
 		return nil
 	}
 	m := &modelsINI{path: path, models: map[string]int{}}

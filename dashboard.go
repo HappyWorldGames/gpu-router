@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -45,13 +46,17 @@ type dashBackend struct {
 	State    string     `json:"state"` // busy | loaded | idle | down
 	VRAMMB   *int       `json:"vram_mb"`
 	Dirty    bool       `json:"dirty"`
-	Running  int        `json:"running,omitempty"`  // ComfyUI: задач в работе
-	Pending  int        `json:"pending,omitempty"`  // ComfyUI: задач в очереди самого ComfyUI
-	Models   []string   `json:"models,omitempty"`   // llama: загруженные модели
-	Speed    *tokenSnap `json:"speed,omitempty"`    // llama: токенов в секунду
-	Inflight int        `json:"inflight,omitempty"` // llama: запросов идёт сейчас
-	Slots    int        `json:"slots,omitempty"`    // llama: слотов у текущей модели (parallel)
-	Model    string     `json:"model,omitempty"`    // llama: модель, к которой идут запросы
+	Running  int        `json:"running,omitempty"`       // ComfyUI: задач в работе
+	Pending  int        `json:"pending,omitempty"`       // ComfyUI: задач в очереди самого ComfyUI
+	Models   []string   `json:"models,omitempty"`        // llama: загруженные модели
+	Speed    *tokenSnap `json:"speed,omitempty"`         // llama: токенов в секунду
+	Inflight int        `json:"inflight,omitempty"`      // llama: запросов идёт сейчас
+	Slots    int        `json:"slots,omitempty"`         // llama: слотов у текущей модели (parallel)
+	Model    string     `json:"model,omitempty"`         // llama: модель, к которой идут запросы
+	HoldLeft int        `json:"hold_left_sec,omitempty"` // llama: сколько ещё держит GPU ради кэша (llama_hold)
+	UnitMB   *int       `json:"unit_mb,omitempty"`       // ОЗУ (RSS) процессов юнита сервиса
+	Auth     string     `json:"auth,omitempty"`          // llama: "client" (ключ проверяется у клиентов), "proxy" (ключ только у прокси), "" (без ключа)
+	AuthErr  bool       `json:"auth_error,omitempty"`    // llama: llama-server не принял ключ прокси
 }
 
 type dashStatus struct {
@@ -63,6 +68,10 @@ type dashStatus struct {
 	} `json:"active"`
 	QueueSize     int             `json:"queue_size"`
 	Tasks         []dashTask      `json:"tasks"`
+	MemTop        []dashProc      `json:"mem_top,omitempty"`     // самые тяжёлые процессы по ОЗУ
+	MemHist       []int           `json:"mem_history,omitempty"` // свободная ОЗУ, МБ (старые → новые)
+	MemHistStep   int             `json:"mem_history_step_sec,omitempty"`
+	MemTotalMB    int             `json:"mem_total_mb,omitempty"`
 	CancelEnabled bool            `json:"cancel_enabled"`
 	QueueMax      int             `json:"queue_max"`
 	GPUMode       string          `json:"gpu_mode"`
@@ -136,6 +145,9 @@ func (s *Server) buildDashStatus() *dashStatus {
 	}
 	st.GPUMode = s.gpuMode()
 	st.Tasks = s.listTasks()
+	top, hist, totalMB, unitMB := s.memData()
+	st.MemTop, st.MemHist, st.MemTotalMB = top, hist, totalMB
+	st.MemHistStep = int(memSampleEvery.Seconds())
 	st.CancelEnabled = s.cancelAllowed()
 
 	var wg sync.WaitGroup
@@ -159,6 +171,7 @@ func (s *Server) buildDashStatus() *dashStatus {
 		b.Dirty = dirty["llama"]
 		models, err := s.llamaLoaded()
 		b.Up = err == nil
+		b.AuthErr = errors.Is(err, errAuthRejected)
 		b.Models = models
 	}()
 
@@ -201,6 +214,21 @@ func (s *Server) buildDashStatus() *dashStatus {
 	sp := s.tokens.snap()
 	st.LLAMA.Speed = &sp
 	st.LLAMA.Inflight, st.LLAMA.Model, st.LLAMA.Slots = inflight, lmodel, llimit
+	st.LLAMA.HoldLeft = int(s.holdLeft().Seconds())
+	if a := s.auth; a != nil {
+		switch {
+		case a.require:
+			st.LLAMA.Auth = "client"
+		case a.backendHdr != "":
+			st.LLAMA.Auth = "proxy"
+		}
+	}
+	if v, ok := unitMB["llama"]; ok && v > 0 {
+		st.LLAMA.UnitMB = &v
+	}
+	if v, ok := unitMB["comfyui"]; ok && v > 0 {
+		st.ComfyUI.UnitMB = &v
+	}
 
 	for svc, b := range map[string]*dashBackend{"comfyui": &st.ComfyUI, "llama": &st.LLAMA} {
 		if u := usage[svc]; u != nil && u.OK {

@@ -46,6 +46,9 @@ type BackendCfg struct {
 	// parallel каждой модели: столько запросов к ней прокси пускает одновременно.
 	// Пусто = параллельные запросы выключены (строго по одному, как раньше).
 	ModelsINI string `yaml:"models_ini"`
+	// APIKey (только llama): ключ, с которым прокси ходит в llama-server, запущенный с --api-key.
+	// Значение, env:ИМЯ или file:/путь (см. auth.go). Пусто = llama-server без ключа.
+	APIKey string `yaml:"api_key"`
 }
 
 type Config struct {
@@ -57,6 +60,12 @@ type Config struct {
 		// ListenHost — на каком адресе слушать. Пусто = все интерфейсы.
 		// Если все клиенты (Open WebUI, n8n) на этой же машине — ставьте 127.0.0.1.
 		ListenHost string `yaml:"listen_host"`
+		// LlamaRequireKey: требовать Bearer-ключ у клиентов llama-прокси. По умолчанию выключено
+		// (прокси пускает всех и сам подставляет llama.api_key; защита тогда только файрвол).
+		LlamaRequireKey bool `yaml:"llama_require_key"`
+		// LlamaAPIKeys: дополнительные ключи клиентов (кроме llama.api_key), каждый можно выдать
+		// своему клиенту и отозвать отдельно. Значение, env:ИМЯ или file:/путь.
+		LlamaAPIKeys []string `yaml:"llama_api_keys"`
 	} `yaml:"proxy"`
 	Queue struct {
 		MaxSize          int `yaml:"max_size"`
@@ -65,6 +74,12 @@ type Config struct {
 		ComfyIdleTimeout int `yaml:"comfy_idle_timeout"`
 		ExecIdleTimeout  int `yaml:"exec_idle_timeout"` // нет данных от бэкенда дольше — обрыв
 		TaskTimeout      int `yaml:"task_timeout"`      // жёсткий потолок на одну задачу
+		// LlamaHold: сколько секунд после последнего запроса llama «держит» GPU, не отдавая его
+		// ComfyUI (чтобы не терять кэш контекста между запросами агента). 0 = выключено.
+		LlamaHold int `yaml:"llama_hold"`
+		// ComfyMaxWait: жёсткий предел (сек), на который удержание может задержать задачу
+		// ComfyUI с момента постановки в очередь. По умолчанию 3600, -1 = без предела.
+		ComfyMaxWait int `yaml:"comfy_max_wait"`
 	} `yaml:"queue"`
 	// Dashboard — страница состояния для home.home (см. dashboard.go).
 	Dashboard struct {
@@ -104,6 +119,9 @@ type Config struct {
 		MinAvailableMB   int    `yaml:"min_available_mb"`      // порог MemAvailable (ОЗУ); -1 = не проверять
 		MemWait          int    `yaml:"mem_wait"`              // сколько ждать восстановления ОЗУ перед задачей, сек
 		CriticalAvailMB  int    `yaml:"critical_available_mb"` // ниже — аварийная остановка работающего GPU-сервиса; -1 = выкл
+		// Sacrifice: имена процессов, которые MemGuard останавливает ПЕРВЫМИ, когда ОЗУ на исходе,
+		// прежде чем трогать llama (по началу имени, без учёта регистра: "Godot"). Пусто = выкл.
+		Sacrifice []string `yaml:"sacrifice"`
 		// CriticalIdleMB — тот же порог, но когда GPU никому не нужен (нет идущей задачи и очередь пуста).
 		// Тогда модель держит память впустую, а виновата обычно не она (например, сборка у агента),
 		// поэтому выбиваем её, только если ОЗУ упала совсем низко. 0 = половина critical_available_mb,
@@ -199,6 +217,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Queue.TaskTimeout <= 0 {
 		cfg.Queue.TaskTimeout = 14400
 	}
+	if cfg.Queue.ComfyMaxWait == 0 {
+		cfg.Queue.ComfyMaxWait = 3600
+	}
 	if cfg.Queue.ComfyIdleTimeout > 0 && cfg.Queue.TaskTimeout < cfg.Queue.ComfyIdleTimeout+600 {
 		cfg.Queue.TaskTimeout = cfg.Queue.ComfyIdleTimeout + 600
 	}
@@ -261,6 +282,11 @@ var controlClient = &http.Client{
 
 // httpDo — короткий служебный запрос с JSON-телом (payload может быть nil).
 func httpDo(method, target string, payload interface{}, timeout time.Duration) (int, []byte, error) {
+	return httpDoH(method, target, payload, timeout, nil)
+}
+
+// httpDoH — то же, с дополнительными заголовками (ключ для llama-server).
+func httpDoH(method, target string, payload interface{}, timeout time.Duration, hdr http.Header) (int, []byte, error) {
 	var rd io.Reader
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -277,6 +303,9 @@ func httpDo(method, target string, payload interface{}, timeout time.Duration) (
 	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range hdr {
+		req.Header[k] = v
 	}
 	resp, err := controlClient.Do(req)
 	if err != nil {
@@ -316,6 +345,8 @@ type Task struct {
 	Live   *liveText    // хвост генерируемого текста (nil, если show_text выключен)
 	state  atomic.Int32 // stQueued / stWaiting / stPreparing / stRunning, см. tasks.go
 	kicked atomic.Bool  // снята вручную со страницы состояния
+	held   atomic.Bool  // отложена удержанием llama (см. sched.go): не считается «ждущей» для таймаутов
+	reason atomic.Int32 // почему ждёт: reasonHold / reasonSlot / ... (для страницы)
 }
 
 // abandoned — задача уже не нужна (клиент ушёл / обработчик завершился).
@@ -368,13 +399,18 @@ type Server struct {
 	lastMemWarn    atomic.Int64 // unix-nano последнего предупреждения о нехватке ОЗУ
 	lastMemTrace   atomic.Int64 // unix-nano последней трассировки памяти во время задачи
 
+	auth   *authState // Bearer-ключи для llama (см. auth.go); nil = без авторизации
 	dash   dashCache  // кэш снимка для страницы состояния
 	tokens tokenMeter // скорость генерации llama (токенов/с), см. tokens.go
 
+	mem         memSnap           // снимок памяти для страницы (см. sysmem.go)
 	clientExact map[string]string // свои названия клиентов: точные адреса (см. tasks.go)
 	clientNets  []clientRule      // и подсети
 	rdns        rdnsCache         // имена хостов из DNS
 	docker      dockerNames       // имена контейнеров Docker (см. docker_names.go)
+
+	sacrificed []time.Time // когда MemGuard останавливал процессы из gpu.sacrifice (только memGuard)
+	deferred   []*Task     // задачи ComfyUI, отложенные удержанием llama (только воркер)
 
 	tasksMu sync.Mutex       // реестр задач для страницы состояния (см. tasks.go)
 	tasks   map[string]*Task // живые задачи по номеру
@@ -670,7 +706,7 @@ func (s *Server) Start() {
 	muxComfy.HandleFunc("/prompt", s.gpuTask("comfyui"))
 	muxComfy.HandleFunc("/api/prompt", s.gpuTask("comfyui"))
 	muxComfy.HandleFunc("/status", s.status)
-	muxComfy.Handle("/", s.reverseProxy(s.Config.comfyURL("/")))
+	muxComfy.Handle("/", s.reverseProxy(s.Config.comfyURL("/"), ""))
 
 	// --- LLAMA-прокси ---
 	muxLlama := http.NewServeMux()
@@ -678,7 +714,7 @@ func (s *Server) Start() {
 		// Служебные пути llama.cpp — напрямую, минуя очередь.
 		// Они не грузят модель в VRAM: /props, /tokenize, /models, /slots и т.д.
 		if isLlamaServicePath(r.URL.Path) {
-			s.reverseProxy(s.Config.llamaURL("/")).ServeHTTP(w, r)
+			s.reverseProxy(s.Config.llamaURL("/"), s.llamaAuthHeader()).ServeHTTP(w, r)
 			return
 		}
 		// Любой другой POST — потенциальная генерация (autoload модели
@@ -689,14 +725,14 @@ func (s *Server) Start() {
 		}
 		// GET/HEAD/OPTIONS — читаем напрямую: health/models/props/WebUI-статика
 		// модель не загружают.
-		s.reverseProxy(s.Config.llamaURL("/")).ServeHTTP(w, r)
+		s.reverseProxy(s.Config.llamaURL("/"), s.llamaAuthHeader()).ServeHTTP(w, r)
 	})
 	// /status оставляем своим, он отладочный
 	muxLlama.HandleFunc("/status", s.status)
 
 	serverLlama := &http.Server{
 		Addr:    s.listenAddr(s.Config.Proxy.LLAMAPort),
-		Handler: loggingMW("LLAMA", muxLlama),
+		Handler: loggingMW("LLAMA", s.llamaAuthMW(muxLlama)),
 	}
 	serverComfy := &http.Server{
 		Addr:    s.listenAddr(s.Config.Proxy.ComfyUIPort),
@@ -715,6 +751,9 @@ func (s *Server) Start() {
 	}()
 
 	serverDash := s.startDashboard()
+	if serverDash != nil {
+		go s.memSampler()
+	}
 
 	go s.worker()
 	go s.watchdog()
@@ -737,9 +776,19 @@ func (s *Server) listenAddr(port int) string {
 	return net.JoinHostPort(s.Config.Proxy.ListenHost, strconv.Itoa(port))
 }
 
-func (s *Server) reverseProxy(backend string) http.Handler {
+// reverseProxy — обратный прокси на бэкенд. auth (если не пусто) подставляется как
+// Authorization; заголовок клиента при этом заменяется, а X-Api-Key убирается.
+func (s *Server) reverseProxy(backend, auth string) http.Handler {
 	target, _ := url.Parse(backend)
 	p := httputil.NewSingleHostReverseProxy(target)
+	if auth != "" {
+		orig := p.Director
+		p.Director = func(req *http.Request) {
+			orig(req)
+			req.Header.Del("X-Api-Key")
+			req.Header.Set("Authorization", auth)
+		}
+	}
 	if s.Config.verbose() {
 		p.ErrorLog = log.New(os.Stderr, "[Proxy] ", 0)
 	} else {
@@ -988,7 +1037,11 @@ func (s *Server) name(service string) string {
 func (s *Server) worker() {
 	taskLimit := time.Duration(s.Config.Queue.TaskTimeout) * time.Second
 
-	for t := range s.taskQueue {
+	for {
+		t := s.nextTask()
+		if t == nil {
+			return
+		}
 		if t.abandoned() {
 			log.Printf("[Queue] %s: клиент ушёл, пропускаем", s.name(t.Service))
 			continue
@@ -1461,80 +1514,7 @@ func memStatus() string {
 	return out
 }
 
-// topMemProcs — самые «тяжёлые» по RSS процессы вместе с systemd-юнитом.
 // Именно это показывает, кто на самом деле съел ОЗУ.
-func topMemProcs(n int) string {
-	type pm struct {
-		pid  int
-		name string
-		kb   int64
-		unit string
-	}
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return ""
-	}
-	var all []pm
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-		if err != nil {
-			continue
-		}
-		p := pm{pid: pid}
-		for _, line := range strings.Split(string(b), "\n") {
-			if strings.HasPrefix(line, "Name:") {
-				p.name = strings.TrimSpace(strings.TrimPrefix(line, "Name:"))
-			} else if strings.HasPrefix(line, "VmRSS:") {
-				if f := strings.Fields(line); len(f) >= 2 {
-					p.kb, _ = strconv.ParseInt(f[1], 10, 64)
-				}
-			}
-		}
-		if p.kb == 0 {
-			continue
-		}
-		if cg, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid)); err == nil {
-			for _, line := range strings.Split(string(cg), "\n") {
-				parts := strings.SplitN(line, ":", 3)
-				if len(parts) < 3 {
-					continue
-				}
-				for _, seg := range strings.Split(parts[2], "/") {
-					if strings.HasSuffix(seg, ".service") {
-						p.unit = seg
-					}
-				}
-				if p.unit != "" {
-					break
-				}
-			}
-		}
-		all = append(all, p)
-	}
-	for i := 0; i < len(all); i++ { // простая сортировка по убыванию RSS
-		for j := i + 1; j < len(all); j++ {
-			if all[j].kb > all[i].kb {
-				all[i], all[j] = all[j], all[i]
-			}
-		}
-	}
-	if len(all) > n {
-		all = all[:n]
-	}
-	parts := make([]string, 0, len(all))
-	for _, p := range all {
-		u := p.unit
-		if u == "" {
-			u = "-"
-		}
-		parts = append(parts, fmt.Sprintf("%s(%d) %.1f ГБ [%s]", p.name, p.pid, float64(p.kb)/1048576, u))
-	}
-	return strings.Join(parts, "; ")
-}
 
 // warnLowMemory пишет предупреждение, если ОЗУ мало (не чаще раза в минуту).
 // Возвращает true, если ОЗУ ниже порога.
@@ -1671,7 +1651,7 @@ func (s *Server) gracefulRelease(service string) bool {
 		}
 		log.Printf("[Unload] Выгружаю модели LLAMA (%d): %v", len(loaded), loaded)
 		for _, id := range loaded {
-			code, _, err := httpDo("POST", s.Config.llamaURL("/models/unload"),
+			code, _, err := s.call("POST", s.Config.llamaURL("/models/unload"),
 				map[string]string{"model": id}, 30*time.Second)
 			if err != nil {
 				log.Printf("[Unload] %s: %v", id, err)
@@ -1689,8 +1669,8 @@ func (s *Server) gracefulRelease(service string) bool {
 	}
 	if r+p > 0 {
 		log.Printf("[Release] ComfyUI занят (running %d, pending %d) — прерываю и чищу очередь", r, p)
-		httpDo("POST", s.Config.comfyURL("/queue"), map[string]interface{}{"clear": true}, 5*time.Second)
-		httpDo("POST", s.Config.comfyURL("/interrupt"), map[string]interface{}{}, 5*time.Second)
+		s.call("POST", s.Config.comfyURL("/queue"), map[string]interface{}{"clear": true}, 5*time.Second)
+		s.call("POST", s.Config.comfyURL("/interrupt"), map[string]interface{}{}, 5*time.Second)
 		for i := 0; i < 20; i++ {
 			time.Sleep(500 * time.Millisecond)
 			if r, p, err := s.comfyBusy(); err != nil || r+p == 0 {
@@ -1699,7 +1679,7 @@ func (s *Server) gracefulRelease(service string) bool {
 		}
 	}
 	log.Printf("[Release] ComfyUI: /free (unload_models + free_memory)")
-	code, _, err := httpDo("POST", s.Config.comfyURL("/free"),
+	code, _, err := s.call("POST", s.Config.comfyURL("/free"),
 		map[string]interface{}{"unload_models": true, "free_memory": true}, 10*time.Second)
 	if err != nil {
 		log.Printf("[Release] ComfyUI /free: %v", err)
@@ -1762,7 +1742,7 @@ func (s *Server) waitBackend(service string) error {
 	start := time.Now()
 	logged := false
 	for {
-		if _, _, err := httpDo("GET", probe, nil, 3*time.Second); err == nil {
+		if _, _, err := s.call("GET", probe, nil, 3*time.Second); err == nil {
 			if logged {
 				log.Printf("[Wait] %s снова доступен (ждали %v)", s.name(service), time.Since(start).Round(time.Second))
 			}
@@ -1850,6 +1830,12 @@ func (s *Server) memGuard() {
 			continue
 		}
 		low = 0
+		// Сначала гасим «дешёвые» процессы из gpu.sacrifice (если заданы): кэш llama дороже.
+		if s.sacrifice(avail) {
+			log.Printf("[MemGuard] КРИТИЧНО: свободно ОЗУ %d МБ < %d МБ. Больше всего держат: %s", avail, crit, topMemProcs(5))
+			cooldown = time.Now().Add(3 * time.Second)
+			continue
+		}
 		s.memEmergency(avail)
 		cooldown = time.Now().Add(20 * time.Second)
 	}
@@ -1904,13 +1890,13 @@ func (s *Server) memEmergency(avail int) {
 	log.Printf("[MemGuard] спасаю систему: останавливаю %s", s.name(victim))
 	// 1) мягко
 	if victim == "comfyui" {
-		httpDo("POST", s.Config.comfyURL("/queue"), map[string]interface{}{"clear": true}, 2*time.Second)
-		httpDo("POST", s.Config.comfyURL("/interrupt"), map[string]interface{}{}, 2*time.Second)
-		httpDo("POST", s.Config.comfyURL("/free"),
+		s.call("POST", s.Config.comfyURL("/queue"), map[string]interface{}{"clear": true}, 2*time.Second)
+		s.call("POST", s.Config.comfyURL("/interrupt"), map[string]interface{}{}, 2*time.Second)
+		s.call("POST", s.Config.comfyURL("/free"),
 			map[string]interface{}{"unload_models": true, "free_memory": true}, 2*time.Second)
 	} else if loaded, err := s.llamaLoaded(); err == nil {
 		for _, id := range loaded {
-			httpDo("POST", s.Config.llamaURL("/models/unload"), map[string]string{"model": id}, 5*time.Second)
+			s.call("POST", s.Config.llamaURL("/models/unload"), map[string]string{"model": id}, 5*time.Second)
 		}
 	}
 	for i := 0; i < 8; i++ {
@@ -2041,9 +2027,13 @@ func (s *Server) watchdogTick(suspect string) string {
 // В router-сборке llama.cpp у каждой модели есть status.value = "unloaded"
 // | "loading" | "loaded". /models — это каталог, он никогда не пустеет.
 func (s *Server) llamaLoaded() ([]string, error) {
-	code, data, err := httpDo("GET", s.Config.llamaURL("/models"), nil, 5*time.Second)
+	code, data, err := s.call("GET", s.Config.llamaURL("/models"), nil, 5*time.Second)
 	if err != nil {
 		return nil, err
+	}
+	if code == http.StatusUnauthorized || code == http.StatusForbidden {
+		s.noteBackendRejected("/models")
+		return nil, errAuthRejected
 	}
 	if code != http.StatusOK {
 		return nil, fmt.Errorf("/models: HTTP %d", code)
@@ -2074,7 +2064,7 @@ func (s *Server) llamaLoaded() ([]string, error) {
 // ==================== COMFYUI: СОСТОЯНИЕ ====================
 
 func (s *Server) comfyBusy() (running, pending int, err error) {
-	code, data, err := httpDo("GET", s.Config.comfyURL("/queue"), nil, 5*time.Second)
+	code, data, err := s.call("GET", s.Config.comfyURL("/queue"), nil, 5*time.Second)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -2175,6 +2165,11 @@ func (s *Server) execBackend(t *Task) int {
 			return 0
 		}
 		req.Header.Set("Content-Type", "application/json")
+		if t.Service == "llama" {
+			if h := s.llamaAuthHeader(); h != "" {
+				req.Header.Set("Authorization", h)
+			}
+		}
 
 		resp, err = backendClient.Do(req)
 		if err == nil {
@@ -2204,6 +2199,9 @@ func (s *Server) execBackend(t *Task) int {
 		}
 	}
 	t.W.WriteHeader(resp.StatusCode)
+	if t.Service == "llama" && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		s.noteBackendRejected("запрос " + t.Path)
+	}
 	if resp.StatusCode >= 400 {
 		// Прокси ошибку не придумывает, а передаёт клиенту как есть, поэтому в логе
 		// нужно видеть, кто и что ответил (текст ошибки пишется ниже из тела).
@@ -2318,11 +2316,20 @@ func main() {
 	}
 	cfg, err := loadConfig(cfgPath)
 	applyDefaults(cfg)
+	if err != nil && len(os.Args) > 1 {
+		// Путь указан явно (например, в юните systemd), а прочитать конфиг нельзя: опечатка в пути
+		// или в YAML. Работать на значениях по умолчанию (без ключа llama!) было бы хуже, чем упасть.
+		log.Fatalf("не удалось загрузить конфиг %s: %v", cfgPath, err)
+	}
 	if err != nil {
 		log.Println("WARNING:", err)
 	} else if abs, aerr := filepath.Abs(cfgPath); aerr == nil {
 		log.Printf("Конфиг: %s", abs)
 	}
 	srv := NewServer(cfg)
+	if err := srv.loadAuth(); err != nil {
+		// Неверная настройка ключей: лучше остановиться, чем молча работать без ключа.
+		log.Fatalf("[Auth] ошибка настройки авторизации: %v", err)
+	}
 	srv.Start()
 }
